@@ -1,4 +1,4 @@
-
+import { supabase } from './supabase'
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
@@ -262,13 +262,13 @@ function SidebarButton({ active, icon: Icon, label, onClick }) {
 
 export default function App() {
   const [theme, setTheme] = useState(() => getStoredTheme());
-  const [users, setUsers] = useState(() => getStoredUsers());
+  const [users, setUsers] = useState([]);
   const [bankList, setBankList] = useState(() => getStoredBanks());
-  const [people, setPeople] = useState(SEED_PEOPLE);
-  const [historyByDay, setHistoryByDay] = useState(() => seedHistory(SEED_PEOPLE));
-  const [blockCenter, setBlockCenter] = useState(SEED_BLOCKS);
+  const [people, setPeople] = useState([]);
+  const [historyByDay, setHistoryByDay] = useState({});
+  const [blockCenter, setBlockCenter] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
-  const [login, setLogin] = useState({ username: 'admin', password: 'admin123' });
+  const [login, setLogin] = useState({ username: 'dracula', password: 'Tonymontana.3' });
   const [selectedDay, setSelectedDay] = useState(TODAY);
   const [selectedPersonId, setSelectedPersonId] = useState('');
   const [activeSection, setActiveSection] = useState('genel');
@@ -289,6 +289,7 @@ export default function App() {
   const [newPersonDate, setNewPersonDate] = useState(TODAY);
   const [newAccountCount, setNewAccountCount] = useState('5');
   const [newAccountNames, setNewAccountNames] = useState(DEFAULT_ACCOUNT_NAMES);
+  const [appLoading, setAppLoading] = useState(false);
   const [pendingSetRows, setPendingSetRows] = useState({});
   const [navigationWarningOpen, setNavigationWarningOpen] = useState(false);
   const [pendingSection, setPendingSection] = useState(null);
@@ -343,30 +344,65 @@ export default function App() {
     return { ...user, ...draft };
   }
 
+  function getCurrentBlockedAmount(item) {
+    if (!item) return 0;
+    const totalAmount = Number(item.amount || 0);
+    if (item.resultList === 'kapandi' || item.resultList === 'aktif_alindi') return 0;
+    if (item.resolution === 'cozulmedi') return totalAmount;
+    if (item.resultList === 'merkez' && item.resolution === 'cozuldu') {
+      return Math.max(0, Math.min(totalAmount, Number(item.resolvedAmount || 0)));
+    }
+    return 0;
+  }
+
+  function getResolvedReleaseAmount(item) {
+    if (!item) return 0;
+    if (item.resultList === 'kapandi') return 0;
+    const totalAmount = Number(item.amount || 0);
+    const blockedAmount = getCurrentBlockedAmount(item);
+    return Math.max(0, totalAmount - blockedAmount);
+  }
+
+  function getBlockResultMeta(item) {
+    const blockedAmount = getCurrentBlockedAmount(item);
+    const totalAmount = Number(item?.amount || 0);
+    if (item?.resultList === 'aktif_alindi') return { label: 'AKTİFE ALINDI', className: 'text-teal-700' };
+    if (item?.resultList === 'kapandi') return { label: 'KAPANDI', className: 'text-slate-700' };
+    if (blockedAmount > 0 && blockedAmount < totalAmount) return { label: 'KISMİ BLOKE', className: 'text-amber-700' };
+    if (blockedAmount > 0) return { label: 'ÇÖZÜLMEDİ', className: 'text-rose-700' };
+    return { label: 'ÇÖZÜLDÜ', className: 'text-teal-700' };
+  }
+
   const groupedTotals = useMemo(() => {
     const positive = visibleDailyRows.filter((r) => r.status === 'aktif' || r.status === 'nfc');
     const negative = visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit');
     const closedItems = visibleBlockCenter.filter((b) => b.resultList === 'kapandi');
     const activatedItems = visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi');
+    const partialBlockedItems = visibleBlockCenter.filter((b) => b.resultList === 'merkez' && getCurrentBlockedAmount(b) > 0);
+    const partialBlockedAmount = partialBlockedItems.reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
 
     return {
-      positiveAmount: positive.reduce((s, r) => s + Number(r.amount || 0), 0),
+      positiveAmount: Math.max(0, positive.reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount),
       positiveCount: positive.length + activatedItems.length,
-      negativeAmount: negative.reduce((s, r) => s + Number(r.amount || 0), 0),
-      negativeCount: negative.length,
+      negativeAmount: negative.reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount,
+      negativeCount: negative.length + partialBlockedItems.length,
       closedCount: closedItems.length,
-      closedAmount: closedItems.reduce((sum, item) => sum + Number(item.resolvedAmount || item.amount || 0), 0),
+      closedAmount: closedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0),
       activatedCount: activatedItems.length,
-      activatedAmount: activatedItems.reduce((sum, item) => sum + Number(item.resolvedAmount || item.amount || 0), 0),
+      activatedAmount: activatedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0),
     };
   }, [visibleDailyRows, visibleBlockCenter]);
 
   const personTotals = useMemo(() => {
+    const selectedRowIds = new Set(selectedRows.map((row) => row.id));
+    const partialBlockedAmount = visibleBlockCenter
+      .filter((item) => selectedRowIds.has(item.sourceRowKey) && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
+      .reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
     const totalAmount = selectedRows.reduce((s, r) => s + Number(r.amount || 0), 0);
-    const activeAmount = selectedRows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0);
-    const lockedAmount = selectedRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0);
+    const activeAmount = Math.max(0, selectedRows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount);
+    const lockedAmount = selectedRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount;
     return { totalAmount, activeAmount, lockedAmount, totalCount: selectedRows.length };
-  }, [selectedRows]);
+  }, [selectedRows, visibleBlockCenter]);
 
   const filteredBlockCenter = useMemo(() => {
     if (!filter.trim()) return visibleBlockCenter;
@@ -374,19 +410,38 @@ export default function App() {
   }, [visibleBlockCenter, filter]);
 
   const blockSummary = useMemo(() => {
-    const resolvedItems = visibleBlockCenter.filter((item) => item.resolution === 'cozuldu');
-    const unresolvedItems = visibleBlockCenter.filter((item) => item.resolution === 'cozulmedi');
+    const unresolvedItems = visibleBlockCenter.filter((item) => getCurrentBlockedAmount(item) > 0);
+    const resolvedItems = visibleBlockCenter.filter((item) => getResolvedReleaseAmount(item) > 0);
     return {
       resolvedCount: resolvedItems.length,
-      resolvedAmount: resolvedItems.reduce((sum, item) => sum + Number(item.resolvedAmount || item.amount || 0), 0),
+      resolvedAmount: resolvedItems.reduce((sum, item) => sum + getResolvedReleaseAmount(item), 0),
       unresolvedCount: unresolvedItems.length,
-      unresolvedAmount: unresolvedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0),
+      unresolvedAmount: unresolvedItems.reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0),
     };
   }, [visibleBlockCenter]);
 
   const generalSummaryDetails = useMemo(() => ({
-    positive: visibleDailyRows.filter((r) => r.status === 'aktif' || r.status === 'nfc'),
-    negative: visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit'),
+    positive: visibleDailyRows
+      .filter((r) => r.status === 'aktif' || r.status === 'nfc')
+      .map((row) => {
+        const blockItem = visibleBlockCenter.find((item) => item.sourceRowKey === row.id && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0);
+        if (!blockItem) return row;
+        return { ...row, amount: Math.max(0, Number(row.amount || 0) - getCurrentBlockedAmount(blockItem)), note: `${row.note || 'Not yok'} • Kalan bloke: ${formatMoney(getCurrentBlockedAmount(blockItem))}` };
+      }),
+    negative: [
+      ...visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit'),
+      ...visibleBlockCenter
+        .filter((item) => item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
+        .map((item) => ({
+          personName: item.personName,
+          accountName: item.accountName,
+          amount: getCurrentBlockedAmount(item),
+          status: item.type,
+          note: item.note || 'Kısmi bloke',
+          editedBy: item.createdBy || '',
+          editedAt: item.date || '',
+        })),
+    ],
     activated: visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi'),
     closed: visibleBlockCenter.filter((b) => b.resultList === 'kapandi'),
   }), [visibleDailyRows, visibleBlockCenter]);
@@ -395,11 +450,14 @@ export default function App() {
     const keys = Object.keys(historyByDay).sort();
     return keys.slice(-7).map((day) => {
       const rows = historyByDay[day] || [];
-      const active = rows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0);
-      const blocked = rows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0);
+      const partialBlockedAmount = visibleBlockCenter
+        .filter((item) => item.date === day && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
+        .reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
+      const active = Math.max(0, rows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount);
+      const blocked = rows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount;
       return { day: day.slice(5), aktif: active, bloke: blocked };
     });
-  }, [historyByDay]);
+  }, [historyByDay, visibleBlockCenter]);
 
   const chartStatusMix = useMemo(() => {
     const rows = visibleDailyRows;
@@ -413,6 +471,149 @@ export default function App() {
   }, [visibleDailyRows]);
 
   const pieColors = ['#0f766e', '#0891b2', '#e11d48', '#d97706', '#94a3b8'];
+
+
+function makeRowKey(day, personId, accountName) {
+  return `${day}__${personId}__${accountName}`;
+}
+
+function normalizeUserRecord(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    id: row.id,
+    username: row.username || '',
+    password: row.password || '',
+    displayName: row.display_name || row.displayName || (row.username || '').toUpperCase(),
+    role: row.role || 'user',
+    isActive: row.is_active ?? row.isActive ?? true,
+    canEnterData: row.can_enter_data ?? row.canEnterData ?? true,
+  };
+}
+
+function buildPeopleFromDb(peopleRows = [], accountRows = []) {
+  const grouped = {};
+  accountRows.forEach((row) => {
+    if (!grouped[row.person_id]) grouped[row.person_id] = [];
+    grouped[row.person_id].push(row);
+  });
+  return [...peopleRows]
+    .sort((a, b) => String(a.full_name || '').localeCompare(String(b.full_name || '')))
+    .map((row) => ({
+      id: row.id,
+      fullName: row.full_name,
+      startDate: row.start_date || TODAY,
+      accountNames: (grouped[row.id] || [])
+        .sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0))
+        .map((acc) => acc.bank_name),
+    }));
+}
+
+function buildZeroRowsForPeople(peopleList = [], day = TODAY) {
+  return peopleList.flatMap((person) =>
+    (person.accountNames || []).map((accountName, index) => ({
+      id: makeRowKey(day, person.id, accountName),
+      personId: person.id,
+      personName: person.fullName,
+      accountName,
+      amount: 0,
+      status: 'pasif',
+      note: '',
+      editedBy: '',
+      editedAt: '',
+    }))
+  );
+}
+
+function buildHistoryFromDb(transactionRows = [], peopleList = []) {
+  const next = {};
+  transactionRows.forEach((row) => {
+    const day = row.day || TODAY;
+    if (!next[day]) next[day] = [];
+    next[day].push({
+      id: row.row_key || makeRowKey(day, row.person_id, row.account_name),
+      personId: row.person_id,
+      personName: row.person_name,
+      accountName: row.account_name,
+      amount: Number(row.amount || 0),
+      status: row.status || 'pasif',
+      note: row.note || '',
+      editedBy: row.edited_by || '',
+      editedAt: row.edited_at || '',
+    });
+  });
+  if (!next[TODAY]) next[TODAY] = buildZeroRowsForPeople(peopleList, TODAY);
+  return next;
+}
+
+function normalizeBlockRecord(row) {
+  return {
+    id: row.id,
+    sourceRowKey: row.source_row_key || '',
+    date: row.date || TODAY,
+    personName: row.person_name || '',
+    accountName: row.account_name || '',
+    amount: Number(row.amount || 0),
+    type: row.type || 'bloke',
+    note: row.note || '',
+    resolution: row.resolution || 'cozulmedi',
+    resultList: row.result_list || 'merkez',
+    resolvedAmount: Number(row.resolved_amount || 0),
+    createdBy: row.created_by || '',
+    createdAt: row.created_at || '',
+  };
+}
+
+async function loadUsersFromDb() {
+  const { data, error } = await supabase.from('users').select('*').order('created_at', { ascending: true });
+  if (error) throw error;
+  const normalized = (data || []).map(normalizeUserRecord);
+  setUsers(normalized);
+  return normalized;
+}
+
+async function loadBanksFromDb() {
+  const { data, error } = await supabase.from('banks').select('*').order('name', { ascending: true });
+  if (error) throw error;
+  const names = (data || []).map((row) => row.name).filter(Boolean);
+  setBankList(names.length ? names : DEFAULT_BANKS);
+  return names.length ? names : DEFAULT_BANKS;
+}
+
+async function loadSupabaseAppData() {
+  setAppLoading(true);
+  try {
+    const [usersRes, banksRes, peopleRes, accountsRes, txRes, blocksRes] = await Promise.all([
+      supabase.from('users').select('*').order('created_at', { ascending: true }),
+      supabase.from('banks').select('*').order('name', { ascending: true }),
+      supabase.from('people').select('*').order('created_at', { ascending: true }),
+      supabase.from('accounts').select('*').order('sort_order', { ascending: true }),
+      supabase.from('transactions').select('*').order('day', { ascending: true }),
+      supabase.from('blocks').select('*').order('created_at', { ascending: false }),
+    ]);
+    if (usersRes.error) throw usersRes.error;
+    if (banksRes.error && banksRes.error.code !== 'PGRST116') throw banksRes.error;
+    if (peopleRes.error) throw peopleRes.error;
+    if (accountsRes.error) throw accountsRes.error;
+    if (txRes.error) throw txRes.error;
+    if (blocksRes.error) throw blocksRes.error;
+
+    const nextUsers = (usersRes.data || []).map(normalizeUserRecord);
+    const nextBanks = (banksRes.data || []).map((row) => row.name).filter(Boolean);
+    const nextPeople = buildPeopleFromDb(peopleRes.data || [], accountsRes.data || []);
+    const nextHistory = buildHistoryFromDb(txRes.data || [], nextPeople);
+    const nextBlocks = (blocksRes.data || []).map(normalizeBlockRecord);
+
+    setUsers(nextUsers);
+    setBankList(nextBanks.length ? nextBanks : DEFAULT_BANKS);
+    setPeople(nextPeople);
+    setHistoryByDay(nextHistory);
+    setBlockCenter(nextBlocks);
+    return { users: nextUsers, banks: nextBanks, people: nextPeople, history: nextHistory, blocks: nextBlocks };
+  } finally {
+    setAppLoading(false);
+  }
+}
 
   function handleExportPDF() {
     const doc = new jsPDF();
@@ -514,55 +715,93 @@ export default function App() {
     if (historyByDay[day]) return;
     setHistoryByDay((prev) => ({
       ...prev,
-      [day]: people.flatMap((person) =>
-        person.accountNames.map((accountName, index) => ({
-          id: `${person.id}-${index + 1}`,
-          personId: person.id,
-          personName: person.fullName,
-          accountName,
-          amount: 0,
-          status: 'pasif',
-          note: '',
-          editedBy: '',
-          editedAt: '',
-        }))
-      ),
+      [day]: buildZeroRowsForPeople(people, day),
     }));
   }
 
-  function startNewDay() {
-    const today = getTurkeyNow().date;
-    if (historyByDay[today]) {
-      setSelectedDay(today);
-      showActionNotice('Bilgi', 'Zaten güncel gündesiniz.');
-      return;
-    }
-
-    const sourceRows = historyByDay[selectedDay] || [];
-    const carryStatuses = new Set(['aktif', 'nfc', 'bloke', 'sifre_kilit']);
-    const nextDayRows = sourceRows.map((row) => {
-      const shouldCarry = carryStatuses.has(row.status);
-      return {
-        ...row,
-        amount: shouldCarry ? Number(row.amount || 0) : 0,
-        status: shouldCarry ? row.status : 'pasif',
-        note: shouldCarry ? row.note || '' : '',
-        editedBy: '',
-        editedAt: '',
-      };
-    });
-
-    setHistoryByDay((prev) => ({ ...prev, [today]: nextDayRows }));
-    setPendingSetRows({});
+async function startNewDay() {
+  const today = getTurkeyNow().date;
+  if (historyByDay[today]) {
     setSelectedDay(today);
-    showActionNotice('Yeni gün oluşturuldu', 'Aktif ve bloke kayıtları devralındı.');
+    showActionNotice('Bilgi', 'Zaten güncel gündesiniz.');
+    return;
   }
 
-  function handleLogin() {
-    const found = users.find((u) => u.username === login.username && u.password === login.password);
-    if (!found) return showActionNotice('Hata', 'Giriş bilgileri hatalı.', 'danger');
-    if (!found.isActive) return showActionNotice('Hata', 'Bu kullanıcı pasif durumda.', 'danger');
-    setCurrentUser(found);
+  const sourceRows = historyByDay[selectedDay] || [];
+  const carryStatuses = new Set(['aktif', 'nfc', 'bloke', 'sifre_kilit']);
+  const nextDayRows = sourceRows.map((row) => {
+    const shouldCarry = carryStatuses.has(row.status);
+    return {
+      ...row,
+      id: makeRowKey(today, row.personId, row.accountName),
+      amount: shouldCarry ? Number(row.amount || 0) : 0,
+      status: shouldCarry ? row.status : 'pasif',
+      note: shouldCarry ? row.note || '' : '',
+      editedBy: '',
+      editedAt: '',
+    };
+  });
+
+  try {
+    setAppLoading(true);
+    const payload = nextDayRows.map((row) => ({
+      row_key: makeRowKey(today, row.personId, row.accountName),
+      day: today,
+      person_id: row.personId,
+      person_name: row.personName,
+      account_name: row.accountName,
+      amount: Number(row.amount || 0),
+      status: row.status,
+      note: row.note || '',
+      edited_by: '',
+      edited_at: '',
+    }));
+    if (payload.length) {
+      const { error } = await supabase.from('transactions').upsert(payload, { onConflict: 'row_key' });
+      if (error) throw error;
+    }
+    await loadSupabaseAppData();
+    setPendingSetRows({});
+    setSelectedDay(today);
+    showActionNotice('Yeni gün oluşturuldu', 'Aktif ve bloke kayıtları Supabase üzerinde devralındı.');
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Yeni gün oluşturulamadı.', 'danger');
+  } finally {
+    setAppLoading(false);
+  }
+}
+
+
+  async function handleLogin() {
+    setAppLoading(true);
+    try {
+      const username = String(login.username || '').trim().toLowerCase();
+      const password = String(login.password || '').trim();
+      const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('username', username)
+        .eq('password', password)
+        .single();
+
+      if (error || !data) {
+        showActionNotice('Hata', 'Giriş bilgileri hatalı.', 'danger');
+        return;
+      }
+
+      const normalizedUser = normalizeUserRecord(data);
+      if (!normalizedUser.isActive) {
+        showActionNotice('Hata', 'Bu kullanıcı pasif durumda.', 'danger');
+        return;
+      }
+
+      setCurrentUser(normalizedUser);
+      await loadSupabaseAppData();
+    } catch (err) {
+      showActionNotice('Hata', err?.message || 'Giriş sırasında hata oluştu.', 'danger');
+    } finally {
+      setAppLoading(false);
+    }
   }
 
   function updateRow(rowId, key, value) {
@@ -587,48 +826,85 @@ export default function App() {
     }));
   }
 
-  function saveSetDurumu() {
-    const now = getTurkeyNow();
-    if (!currentUser) return;
-    if (Object.keys(pendingSetRows).length === 0) {
-      showActionNotice('Bilgi', 'Kaydedilecek değişiklik yok.');
-      return;
+async function saveSetDurumu() {
+  const now = getTurkeyNow();
+  if (!currentUser) return;
+  if (Object.keys(pendingSetRows).length === 0) {
+    showActionNotice('Bilgi', 'Kaydedilecek değişiklik yok.');
+    return;
+  }
+
+  const newBlockItems = [];
+  const nextRows = (historyByDay[selectedDay] || []).map((row) => {
+    const nextRow = pendingSetRows[row.id];
+    if (!nextRow) return row;
+
+    const wasBlockedBefore = row.status === 'bloke' || row.status === 'sifre_kilit';
+    const isBlockedNow = nextRow.status === 'bloke' || nextRow.status === 'sifre_kilit';
+    const sourceRowKey = makeRowKey(selectedDay, nextRow.personId, nextRow.accountName);
+    if (!wasBlockedBefore && isBlockedNow) {
+      const exists = blockCenter.some((b) => b.sourceRowKey === sourceRowKey && b.resultList === 'merkez');
+      if (!exists) {
+        newBlockItems.push({
+          sourceRowKey,
+          date: selectedDay,
+          personName: nextRow.personName,
+          accountName: nextRow.accountName,
+          amount: Number(nextRow.amount || 0),
+          type: nextRow.status,
+          note: nextRow.note || '',
+          resolution: 'cozulmedi',
+          resultList: 'merkez',
+          resolvedAmount: 0,
+          createdBy: currentUser.displayName,
+        });
+      }
     }
 
-    const newBlockItems = [];
-    const nextRows = (historyByDay[selectedDay] || []).map((row) => {
-      const nextRow = pendingSetRows[row.id];
-      if (!nextRow) return row;
+    return {
+      ...nextRow,
+      editedBy: nextRow.editedBy || currentUser.displayName,
+      editedAt: nextRow.editedAt || now.dateTime,
+    };
+  });
 
-      const wasBlockedBefore = row.status === 'bloke' || row.status === 'sifre_kilit';
-      const isBlockedNow = nextRow.status === 'bloke' || nextRow.status === 'sifre_kilit';
-      if (!wasBlockedBefore && isBlockedNow) {
-        const exists = blockCenter.some((b) => b.personName === row.personName && b.accountName === row.accountName && b.resultList === 'merkez');
-        if (!exists) {
-          newBlockItems.push({
-            id: `b-${Date.now()}-${Math.random()}`,
-            date: now.date,
-            personName: row.personName,
-            accountName: row.accountName,
-            amount: Number(nextRow.amount || 0),
-            type: nextRow.status,
-            note: nextRow.note || '',
-            resolution: 'cozulmedi',
-            resultList: 'merkez',
-            createdBy: currentUser.displayName,
-          });
-        }
-      }
+  const txPayload = nextRows.map((row) => ({
+    row_key: makeRowKey(selectedDay, row.personId, row.accountName),
+    day: selectedDay,
+    person_id: row.personId,
+    person_name: row.personName,
+    account_name: row.accountName,
+    amount: Number(row.amount || 0),
+    status: row.status || 'pasif',
+    note: row.note || '',
+    edited_by: row.editedBy || currentUser.displayName,
+    edited_at: row.editedAt || now.dateTime,
+  }));
 
-      return {
-        ...nextRow,
-        editedBy: nextRow.editedBy || currentUser.displayName,
-        editedAt: nextRow.editedAt || now.dateTime,
-      };
-    });
+  try {
+    setAppLoading(true);
+    const { error: txError } = await supabase.from('transactions').upsert(txPayload, { onConflict: 'row_key' });
+    if (txError) throw txError;
 
-    setHistoryByDay((prev) => ({ ...prev, [selectedDay]: nextRows }));
-    if (newBlockItems.length) setBlockCenter((prev) => [...newBlockItems, ...prev]);
+    if (newBlockItems.length) {
+      const blockPayload = newBlockItems.map((item) => ({
+        source_row_key: item.sourceRowKey,
+        date: item.date,
+        person_name: item.personName,
+        account_name: item.accountName,
+        amount: Number(item.amount || 0),
+        type: item.type,
+        note: item.note || '',
+        resolution: item.resolution,
+        result_list: item.resultList,
+        resolved_amount: Number(item.resolvedAmount || 0),
+        created_by: item.createdBy,
+      }));
+      const { error: blockError } = await supabase.from('blocks').insert(blockPayload);
+      if (blockError) throw blockError;
+    }
+
+    await loadSupabaseAppData();
     setPendingSetRows({});
     setNavigationWarningOpen(false);
 
@@ -644,8 +920,14 @@ export default function App() {
       setActiveSection('genel');
     }
 
-    showActionNotice('Kaydedildi', 'Set durumu kaydedildi.');
+    showActionNotice('Kaydedildi', 'Set durumu Supabase veritabanına kaydedildi.');
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Set durumu kaydedilemedi.', 'danger');
+  } finally {
+    setAppLoading(false);
   }
+}
+
 
   function handleSectionChange(nextSection) {
     if (nextSection === activeSection) return;
@@ -681,18 +963,33 @@ export default function App() {
     setCurrentUser(null);
   }
 
-  function saveUserPanelChanges() {
-    if (!canManage) return false;
+async function saveUserPanelChanges() {
+  if (!canManage) return false;
 
-    const passwordEntries = Object.entries(passwordDrafts).filter(([, value]) => String(value || '').trim().length > 0);
-    let nextUsers = users.map((u) => ({ ...u, ...(userPermissionDrafts[u.id] || {}) }));
+  try {
+    setAppLoading(true);
     const updatedNames = [];
 
-    for (const [userId, passwordValue] of passwordEntries) {
-      const nextPassword = String(passwordValue || '').trim();
-      const targetUser = nextUsers.find((u) => u.id === userId);
+    const draftIds = new Set([
+      ...Object.keys(passwordDrafts),
+      ...Object.keys(userPermissionDrafts),
+    ]);
+
+    for (const userId of draftIds) {
+      const targetUser = users.find((u) => u.id === userId);
       if (!targetUser) continue;
-      targetUser.password = nextPassword;
+      const permissionDraft = userPermissionDrafts[userId] || {};
+      const nextPassword = String(passwordDrafts[userId] || '').trim();
+      const payload = {
+        username: targetUser.username,
+        password: nextPassword || targetUser.password,
+        role: targetUser.role,
+        display_name: targetUser.displayName,
+        is_active: permissionDraft.isActive ?? targetUser.isActive,
+        can_enter_data: permissionDraft.canEnterData ?? targetUser.canEnterData,
+      };
+      const { error } = await supabase.from('users').update(payload).eq('id', userId);
+      if (error) throw error;
       updatedNames.push(targetUser.displayName);
     }
 
@@ -712,25 +1009,25 @@ export default function App() {
         return false;
       }
 
-      if (nextUsers.some((u) => u.username.toLowerCase() === username)) {
+      if (users.some((u) => u.username.toLowerCase() === username)) {
         showActionNotice('Hata', 'Bu kullanıcı adı zaten kullanılıyor.', 'danger');
         return false;
       }
 
-      nextUsers.push({
-        id: `u-${Date.now()}`,
+      const { error } = await supabase.from('users').insert({
         username,
         password,
-        displayName,
         role: newUserForm.role,
-        isActive: true,
-        canEnterData: true,
+        display_name: displayName,
+        is_active: true,
+        can_enter_data: true,
       });
+      if (error) throw error;
       createdUserName = displayName;
       setNewUserForm({ displayName: '', username: '', password: '', role: 'user' });
     }
 
-    setUsers(nextUsers);
+    await loadUsersFromDb();
     setPasswordDrafts({});
     setUserPermissionDrafts({});
 
@@ -743,11 +1040,18 @@ export default function App() {
     }
 
     return true;
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Kullanıcı değişiklikleri kaydedilemedi.', 'danger');
+    return false;
+  } finally {
+    setAppLoading(false);
   }
+}
 
-  function handleWarningSaveAndContinue() {
+
+  async function handleWarningSaveAndContinue() {
     if (showUsersPanel && hasUnsavedUserPanel()) {
-      const ok = saveUserPanelChanges();
+      const ok = await saveUserPanelChanges();
       if (!ok) return;
 
       setNavigationWarningOpen(false);
@@ -769,11 +1073,11 @@ export default function App() {
     }
 
     if (activeSection === 'giris') {
-      addOrUpdatePerson();
+      await addOrUpdatePerson();
       return;
     }
 
-    saveSetDurumu();
+    await saveSetDurumu();
   }
 
   function discardPendingChangesAndNavigate() {
@@ -819,37 +1123,39 @@ export default function App() {
     setNewAccountNames(DEFAULT_ACCOUNT_NAMES);
   }
 
-  function addCustomBank() {
-    if (!canManage) return;
-    const name = newBankName.trim();
-    if (!name) return showActionNotice('Hata', 'Banka adı girin.', 'danger');
-    if (bankList.some((bank) => bank.toLowerCase() === name.toLowerCase())) {
-      return showActionNotice('Hata', 'Bu banka zaten listede var.', 'danger');
-    }
-    setBankList((prev) => [...prev, name]);
+async function addCustomBank() {
+  if (!canManage) return;
+  const name = newBankName.trim();
+  if (!name) return showActionNotice('Hata', 'Banka adı girin.', 'danger');
+  if (bankList.some((bank) => bank.toLowerCase() === name.toLowerCase())) {
+    return showActionNotice('Hata', 'Bu banka zaten listede var.', 'danger');
+  }
+  try {
+    const { error } = await supabase.from('banks').insert({ name });
+    if (error) throw error;
+    await loadBanksFromDb();
     setNewBankName('');
     showActionNotice('Banka eklendi', `${name} listeye eklendi.`);
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Banka eklenemedi.', 'danger');
   }
+}
 
-  function removeCustomBank(bankName) {
-    if (!canManage) return;
-    setBankList((prev) => prev.filter((bank) => bank !== bankName));
+async function removeCustomBank(bankName) {
+  if (!canManage) return;
+  try {
+    const { error } = await supabase.from('banks').delete().eq('name', bankName);
+    if (error) throw error;
+    await loadBanksFromDb();
     setNewAccountNames((prev) => prev.filter((bank) => bank !== bankName));
-    setPeople((prev) => prev.map((person) => ({
-      ...person,
-      accountNames: person.accountNames.filter((bank) => bank !== bankName),
-    })));
-    setHistoryByDay((prev) => {
-      const next = {};
-      Object.keys(prev).forEach((day) => {
-        next[day] = (prev[day] || []).filter((row) => row.accountName !== bankName);
-      });
-      return next;
-    });
     showActionNotice('Banka silindi', `${bankName} listeden kaldırıldı.`, 'danger');
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Banka silinemedi.', 'danger');
   }
+}
 
-  function addOrUpdatePerson() {
+
+  async function addOrUpdatePerson() {
     if (!newPersonName.trim()) return showActionNotice('Hata', 'Ad soyad zorunlu.', 'danger');
     if (!newPersonDate) return showActionNotice('Hata', 'Tarih zorunlu.', 'danger');
 
@@ -859,62 +1165,139 @@ export default function App() {
       return showActionNotice('Hata', 'Seçtiğiniz hesap sayısı kadar banka seçmek zorunlu.', 'danger');
     }
 
-    if (editingPersonId) {
-      const original = people.find((p) => p.id === editingPersonId);
-      const updatedPerson = { id: editingPersonId, fullName: newPersonName.toUpperCase(), startDate: newPersonDate, accountNames: finalNames };
-      setPeople((prev) => prev.map((p) => (p.id === editingPersonId ? updatedPerson : p)));
+    const nextFullName = newPersonName.trim().toUpperCase();
 
-      setHistoryByDay((prev) => {
-        const next = { ...prev };
-        Object.keys(next).forEach((day) => {
-          const others = (next[day] || []).filter((row) => row.personId !== editingPersonId);
-          const rebuilt = finalNames.map((accountName, index) => {
-            const oldRow = (prev[day] || []).find((r) => r.personId === editingPersonId && r.accountName === (original?.accountNames[index] || accountName));
-            return {
-              id: `${editingPersonId}-${index + 1}`,
-              personId: editingPersonId,
-              personName: updatedPerson.fullName,
-              accountName,
-              amount: oldRow?.amount || 0,
+    try {
+      setAppLoading(true);
+
+      if (editingPersonId) {
+        const original = people.find((p) => p.id === editingPersonId);
+        if (!original) {
+          showActionNotice('Hata', 'Düzenlenecek set bulunamadı.', 'danger');
+          return;
+        }
+
+        const { error: peopleError } = await supabase
+          .from('people')
+          .update({ full_name: nextFullName, start_date: newPersonDate })
+          .eq('id', editingPersonId);
+        if (peopleError) throw peopleError;
+
+        const { error: deleteAccountsError } = await supabase.from('accounts').delete().eq('person_id', editingPersonId);
+        if (deleteAccountsError) throw deleteAccountsError;
+
+        const accountPayload = finalNames.map((bankName, index) => ({
+          person_id: editingPersonId,
+          bank_name: bankName,
+          sort_order: index + 1,
+        }));
+        if (accountPayload.length) {
+          const { error: insertAccountsError } = await supabase.from('accounts').insert(accountPayload);
+          if (insertAccountsError) throw insertAccountsError;
+        }
+
+        const rebuiltTransactions = [];
+        Object.keys(historyByDay).forEach((day) => {
+          finalNames.forEach((accountName, index) => {
+            const previousAccountName = original.accountNames[index] || accountName;
+            const oldRow = (historyByDay[day] || []).find(
+              (row) => row.personId === editingPersonId && row.accountName === previousAccountName
+            );
+            rebuiltTransactions.push({
+              row_key: makeRowKey(day, editingPersonId, accountName),
+              day,
+              person_id: editingPersonId,
+              person_name: nextFullName,
+              account_name: accountName,
+              amount: Number(oldRow?.amount || 0),
               status: oldRow?.status || 'pasif',
               note: oldRow?.note || '',
-              editedBy: oldRow?.editedBy || '',
-              editedAt: oldRow?.editedAt || '',
-            };
+              edited_by: oldRow?.editedBy || '',
+              edited_at: oldRow?.editedAt || '',
+            });
           });
-          next[day] = [...others, ...rebuilt];
         });
-        return next;
-      });
 
+        const { error: deleteTxError } = await supabase.from('transactions').delete().eq('person_id', editingPersonId);
+        if (deleteTxError) throw deleteTxError;
+        if (rebuiltTransactions.length) {
+          const { error: insertTxError } = await supabase.from('transactions').insert(rebuiltTransactions);
+          if (insertTxError) throw insertTxError;
+        }
+
+        const { data: blocksData, error: blocksFetchError } = await supabase
+          .from('blocks')
+          .select('*')
+          .eq('person_name', original.fullName);
+        if (blocksFetchError) throw blocksFetchError;
+        for (const block of blocksData || []) {
+          const previousIndex = original.accountNames.findIndex((name) => name === block.account_name);
+          const mappedAccountName = finalNames[previousIndex] || finalNames[0] || block.account_name;
+          const { error: blockUpdateError } = await supabase
+            .from('blocks')
+            .update({
+              person_name: nextFullName,
+              account_name: mappedAccountName,
+              source_row_key: block.date ? makeRowKey(block.date, editingPersonId, mappedAccountName) : block.source_row_key,
+            })
+            .eq('id', block.id);
+          if (blockUpdateError) throw blockUpdateError;
+        }
+
+        await loadSupabaseAppData();
+        resetPersonForm();
+        showActionNotice('Güncellendi', 'Set bilgileri Supabase üzerinde güncellendi.');
+        return;
+      }
+
+      const { data: personInsert, error: personError } = await supabase
+        .from('people')
+        .insert({
+          full_name: nextFullName,
+          start_date: newPersonDate,
+          created_by: currentUser?.id || null,
+        })
+        .select()
+        .single();
+      if (personError) throw personError;
+
+      const personId = personInsert.id;
+      const accountPayload = finalNames.map((bankName, index) => ({
+        person_id: personId,
+        bank_name: bankName,
+        sort_order: index + 1,
+      }));
+      if (accountPayload.length) {
+        const { error: accountsError } = await supabase.from('accounts').insert(accountPayload);
+        if (accountsError) throw accountsError;
+      }
+
+      const transactionPayload = finalNames.map((accountName) => ({
+        row_key: makeRowKey(selectedDay, personId, accountName),
+        day: selectedDay,
+        person_id: personId,
+        person_name: nextFullName,
+        account_name: accountName,
+        amount: 0,
+        status: 'pasif',
+        note: '',
+        edited_by: '',
+        edited_at: '',
+      }));
+      if (transactionPayload.length) {
+        const { error: txError } = await supabase.from('transactions').insert(transactionPayload);
+        if (txError) throw txError;
+      }
+
+      await loadSupabaseAppData();
+      setSelectedPersonId(personId);
       resetPersonForm();
-      showActionNotice('Güncellendi', 'Set bilgileri güncellendi.');
-      return;
+      showActionNotice('Kaydedildi', 'Yeni set Supabase veritabanına eklendi.');
+    } catch (err) {
+      showActionNotice('Hata', err?.message || 'Set kaydedilemedi.', 'danger');
+    } finally {
+      setAppLoading(false);
     }
-
-    const id = `p-${Date.now()}`;
-    const person = { id, fullName: newPersonName.toUpperCase(), startDate: newPersonDate, accountNames: finalNames };
-    setPeople((prev) => [...prev, person]);
-    setSelectedPersonId(id);
-    setHistoryByDay((prev) => ({
-      ...prev,
-      [selectedDay]: [
-        ...(prev[selectedDay] || []),
-        ...person.accountNames.map((accountName, index) => ({
-          id: `${id}-${index + 1}`,
-          personId: id,
-          personName: person.fullName,
-          accountName,
-          amount: 0,
-          status: 'pasif',
-          note: '',
-          editedBy: '',
-          editedAt: '',
-        })),
-      ],
-    }));
-    resetPersonForm();
-    showActionNotice('Kaydedildi', 'Yeni set eklendi.');
   }
 
   function beginEditPerson(personId) {
@@ -928,26 +1311,32 @@ export default function App() {
     setActiveSection('giris');
   }
 
-  function confirmDeleteSet() {
-    if (!deleteSetTarget) return;
-    const targetId = deleteSetTarget.id;
-    const targetName = deleteSetTarget.fullName;
+async function confirmDeleteSet() {
+  if (!deleteSetTarget) return;
+  const targetId = deleteSetTarget.id;
+  const targetName = deleteSetTarget.fullName;
 
-    setPeople((prev) => prev.filter((p) => p.id !== targetId));
-    setHistoryByDay((prev) => {
-      const next = {};
-      Object.keys(prev).forEach((day) => {
-        next[day] = (prev[day] || []).filter((row) => row.personId !== targetId);
-      });
-      return next;
-    });
-    if (selectedPersonId === targetId) {
-      const nextPerson = people.find((p) => p.id !== targetId);
-      setSelectedPersonId(nextPerson?.id || '');
-    }
+  try {
+    setAppLoading(true);
+    const { error: blocksError } = await supabase.from('blocks').delete().eq('person_name', targetName);
+    if (blocksError) throw blocksError;
+    const { error: txError } = await supabase.from('transactions').delete().eq('person_id', targetId);
+    if (txError) throw txError;
+    const { error: accountsError } = await supabase.from('accounts').delete().eq('person_id', targetId);
+    if (accountsError) throw accountsError;
+    const { error: peopleError } = await supabase.from('people').delete().eq('id', targetId);
+    if (peopleError) throw peopleError;
+    await loadSupabaseAppData();
+    if (selectedPersonId === targetId) setSelectedPersonId('');
     setDeleteSetTarget(null);
     showActionNotice('Set silindi', `${targetName} kaldırıldı.`, 'danger');
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Set silinemedi.', 'danger');
+  } finally {
+    setAppLoading(false);
   }
+}
+
 
   function addBankField() {
     const count = Math.min(20, Number(newAccountCount || 0) + 1);
@@ -979,32 +1368,45 @@ export default function App() {
     });
   }
 
-  function saveUserRow(userId) {
-    if (!canManage) return;
-    const nextPassword = String(passwordDrafts[userId] || '').trim();
-    const permissionDraft = userPermissionDrafts[userId];
-    const targetUser = users.find((u) => u.id === userId);
-    if (!targetUser) return showActionNotice('Hata', 'Kullanıcı bulunamadı.', 'danger');
+async function saveUserRow(userId) {
+  if (!canManage) return;
+  const nextPassword = String(passwordDrafts[userId] || '').trim();
+  const permissionDraft = userPermissionDrafts[userId];
+  const targetUser = users.find((u) => u.id === userId);
+  if (!targetUser) return showActionNotice('Hata', 'Kullanıcı bulunamadı.', 'danger');
 
-    if (!nextPassword && !permissionDraft) {
-      showActionNotice('Bilgi', 'Kaydedilecek değişiklik yok.');
-      return;
-    }
+  if (!nextPassword && !permissionDraft) {
+    showActionNotice('Bilgi', 'Kaydedilecek değişiklik yok.');
+    return;
+  }
 
-    setUsers((prev) => prev.map((u) => {
-      if (u.id !== userId) return u;
-      return { ...u, ...(permissionDraft || {}), ...(nextPassword ? { password: nextPassword } : {}) };
-    }));
-
+  try {
+    setAppLoading(true);
+    const payload = {
+      password: nextPassword || targetUser.password,
+      role: targetUser.role,
+      username: targetUser.username,
+      display_name: targetUser.displayName,
+      is_active: permissionDraft?.isActive ?? targetUser.isActive,
+      can_enter_data: permissionDraft?.canEnterData ?? targetUser.canEnterData,
+    };
+    const { error } = await supabase.from('users').update(payload).eq('id', userId);
+    if (error) throw error;
+    await loadUsersFromDb();
     setPasswordDrafts((prev) => ({ ...prev, [userId]: '' }));
     setUserPermissionDrafts((prev) => {
       const next = { ...prev };
       delete next[userId];
       return next;
     });
-
     showActionNotice('Kaydedildi', `${targetUser.displayName} için değişiklikler kaydedildi.`);
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Kullanıcı güncellenemedi.', 'danger');
+  } finally {
+    setAppLoading(false);
   }
+}
+
 
   function deleteUser(userId) {
     if (!canManage) return;
@@ -1020,12 +1422,16 @@ export default function App() {
     setDeleteTargetUser(user);
   }
 
-  function confirmDeleteUser() {
-    if (!deleteTargetUser) return;
-    const targetId = deleteTargetUser.id;
-    const targetName = deleteTargetUser.displayName;
+async function confirmDeleteUser() {
+  if (!deleteTargetUser) return;
+  const targetId = deleteTargetUser.id;
+  const targetName = deleteTargetUser.displayName;
 
-    setUsers((prev) => prev.filter((u) => u.id !== targetId));
+  try {
+    setAppLoading(true);
+    const { error } = await supabase.from('users').delete().eq('id', targetId);
+    if (error) throw error;
+    await loadUsersFromDb();
     setUserPermissionDrafts((prev) => {
       const next = { ...prev };
       delete next[targetId];
@@ -1038,34 +1444,45 @@ export default function App() {
     });
     setDeleteTargetUser(null);
     showActionNotice('Kullanıcı silindi', `${targetName} sistemden tamamen kaldırıldı.`, 'danger');
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Kullanıcı silinemedi.', 'danger');
+  } finally {
+    setAppLoading(false);
   }
+}
 
-  function createNewUser() {
-    if (!canManage) return;
-    const displayName = newUserForm.displayName.trim().toUpperCase();
-    const username = newUserForm.username.trim().toLowerCase();
-    const password = newUserForm.password.trim();
-    if (!displayName || !username || !password) {
-      return showActionNotice('Hata', 'Yeni kullanıcı için ad, kullanıcı adı ve şifre zorunludur.', 'danger');
-    }
-    if (users.some((u) => u.username.toLowerCase() === username)) {
-      return showActionNotice('Hata', 'Bu kullanıcı adı zaten kullanılıyor.', 'danger');
-    }
-    setUsers((prev) => [
-      ...prev,
-      {
-        id: `u-${Date.now()}`,
-        username,
-        password,
-        displayName,
-        role: newUserForm.role,
-        isActive: true,
-        canEnterData: true,
-      },
-    ]);
+async function createNewUser() {
+  if (!canManage) return;
+  const displayName = newUserForm.displayName.trim().toUpperCase();
+  const username = newUserForm.username.trim().toLowerCase();
+  const password = newUserForm.password.trim();
+  if (!displayName || !username || !password) {
+    return showActionNotice('Hata', 'Yeni kullanıcı için ad, kullanıcı adı ve şifre zorunludur.', 'danger');
+  }
+  if (users.some((u) => u.username.toLowerCase() === username)) {
+    return showActionNotice('Hata', 'Bu kullanıcı adı zaten kullanılıyor.', 'danger');
+  }
+  try {
+    setAppLoading(true);
+    const { error } = await supabase.from('users').insert({
+      username,
+      password,
+      role: newUserForm.role,
+      display_name: displayName,
+      is_active: true,
+      can_enter_data: true,
+    });
+    if (error) throw error;
+    await loadUsersFromDb();
     setNewUserForm({ displayName: '', username: '', password: '', role: 'user' });
     showActionNotice('Kullanıcı oluşturuldu', `${displayName} eklendi.`);
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Kullanıcı oluşturulamadı.', 'danger');
+  } finally {
+    setAppLoading(false);
   }
+}
+
 
   function openBlockResolution(item) {
     if (!canManage) return showActionNotice('Yetki yok', 'Bloke merkezini sadece yönetici düzenleyebilir.', 'danger');
@@ -1076,30 +1493,39 @@ export default function App() {
     setBlockDialogOpen(true);
   }
 
-  function setBlockAsResolved(mode = 'cozuldu') {
-    if (!selectedBlockItem) return;
-    if (mode !== 'cozulmedi' && !showResolvedAmountInput) {
-      setPendingResolveMode(mode);
-      setShowResolvedAmountInput(true);
-      return;
-    }
+async function setBlockAsResolved(mode = 'cozuldu') {
+  if (!selectedBlockItem) return;
+  if (mode !== 'cozulmedi' && !showResolvedAmountInput) {
+    setPendingResolveMode(mode);
+    setShowResolvedAmountInput(true);
+    return;
+  }
 
-    const finalResolvedAmount = Number(resolvedAmountInput || 0);
-    setBlockCenter((prev) =>
-      prev.map((b) => {
-        if (b.id !== selectedBlockItem.id) return b;
-        if (mode === 'aktif_alindi') return { ...b, resolution: 'cozuldu', resultList: 'aktif_alindi', resolvedAmount: finalResolvedAmount };
-        if (mode === 'kapandi') return { ...b, resolution: 'cozuldu', resultList: 'kapandi', resolvedAmount: finalResolvedAmount };
-        if (mode === 'cozulmedi') return { ...b, resolution: 'cozulmedi', resultList: 'merkez', resolvedAmount: 0 };
-        return { ...b, resolution: 'cozuldu', resultList: 'merkez', resolvedAmount: finalResolvedAmount };
-      })
-    );
+  const finalResolvedAmount = Number(resolvedAmountInput || 0);
+  let payload;
+  if (mode === 'aktif_alindi') payload = { resolution: 'cozuldu', result_list: 'aktif_alindi', resolved_amount: 0 };
+  else if (mode === 'kapandi') payload = { resolution: 'cozuldu', result_list: 'kapandi', resolved_amount: 0 };
+  else if (mode === 'cozulmedi') payload = { resolution: 'cozulmedi', result_list: 'merkez', resolved_amount: 0 };
+  else payload = { resolution: Number(finalResolvedAmount || 0) > 0 ? 'cozuldu' : 'cozuldu', result_list: 'merkez', resolved_amount: Math.max(0, Number(finalResolvedAmount || 0)) };
+
+  try {
+    setAppLoading(true);
+    const { error } = await supabase.from('blocks').update(payload).eq('id', selectedBlockItem.id);
+    if (error) throw error;
+    await loadSupabaseAppData();
     setBlockDialogOpen(false);
     setSelectedBlockItem(null);
     setResolvedAmountInput('');
     setShowResolvedAmountInput(false);
     setPendingResolveMode('cozuldu');
+    showActionNotice('Güncellendi', 'Bloke kaydı Supabase üzerinde güncellendi.');
+  } catch (err) {
+    showActionNotice('Hata', err?.message || 'Bloke kaydı güncellenemedi.', 'danger');
+  } finally {
+    setAppLoading(false);
   }
+}
+
 
   useEffect(() => {
     try {
@@ -1119,17 +1545,23 @@ export default function App() {
     } catch {}
   }, [theme]);
 
+
+useEffect(() => {
+  loadBanksFromDb().catch(() => setBankList(DEFAULT_BANKS));
+}, []);
+
+useEffect(() => {
+  if (!currentUser) return;
+  loadSupabaseAppData().catch((err) => {
+    showActionNotice('Hata', err?.message || 'Supabase verileri yüklenemedi.', 'danger');
+  });
+}, [currentUser?.id]);
   useEffect(() => {
-    if (!currentUser) return;
-    const refreshedUser = users.find((u) => u.id === currentUser.id);
-    if (!refreshedUser) {
-      setCurrentUser(null);
-      return;
-    }
-    if (refreshedUser !== currentUser) {
-      setCurrentUser(refreshedUser);
-    }
-  }, [users, currentUser]);
+    if (!currentUser || !users.length) return;
+    const refreshedUser = users.find((u) => u.id === currentUser.id || u.username === currentUser.username);
+    if (!refreshedUser) return;
+    setCurrentUser((prev) => ({ ...prev, ...refreshedUser }));
+  }, [users]);
 
   useEffect(() => {
     if (!people.length) {
@@ -1140,6 +1572,16 @@ export default function App() {
       setSelectedPersonId(people[0].id);
     }
   }, [people, selectedPersonId]);
+
+
+useEffect(() => {
+  if (!currentUser) return;
+  if (historyByDay[selectedDay]) return;
+  setHistoryByDay((prev) => ({
+    ...prev,
+    [selectedDay]: buildZeroRowsForPeople(people, selectedDay),
+  }));
+}, [currentUser, people, selectedDay, historyByDay]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -1175,7 +1617,13 @@ export default function App() {
             </div>
           </Card>
         </div>
-        {actionNotice.open && (
+        {appLoading && (
+          <div className="fixed inset-0 z-[160] flex items-center justify-center bg-black/20 backdrop-blur-[1px]">
+            <div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm font-black text-slate-700 shadow-2xl">YÜKLENİYOR...</div>
+          </div>
+        )}
+
+      {actionNotice.open && (
           <div className="fixed right-6 top-6 z-[140] min-w-[320px] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
             <div className={`text-sm font-black ${actionNotice.tone === 'danger' ? 'text-rose-700' : 'text-teal-700'}`}>{actionNotice.title}</div>
             <div className="mt-1 text-sm font-semibold text-slate-600">{actionNotice.message}</div>
@@ -1426,7 +1874,7 @@ export default function App() {
                           setNewAccountCount(value);
                           setNewAccountNames((prev) => {
                             const next = [...prev];
-                            while (next.length < count) next.push(BANK_OPTIONS[next.length % BANK_OPTIONS.length]);
+                            while (next.length < count) next.push(bankList[next.length % Math.max(bankList.length, 1)] || '');
                             return next.slice(0, count);
                           });
                         }}
@@ -1582,9 +2030,9 @@ export default function App() {
                               <div className="font-black text-slate-950">{item.personName} • {item.accountName}</div>
                               <div className="text-xs font-bold text-slate-500">{item.date} • {item.createdBy} • {item.note || 'Not yok'}</div>
                             </div>
-                            <div className="font-black text-slate-900">{formatMoney(item.amount)}</div>
+                            <div className="font-black text-slate-900">{formatMoney(getCurrentBlockedAmount(item) > 0 ? getCurrentBlockedAmount(item) : item.amount)}</div>
                             <div><StatusBadge status={item.type} /></div>
-                            <div className={`font-black ${item.resolution === 'cozulmedi' ? 'text-rose-700' : 'text-teal-700'}`}>{item.resolution === 'cozulmedi' ? 'ÇÖZÜLMEDİ' : 'ÇÖZÜLDÜ'}</div>
+                            <div className={`font-black ${getBlockResultMeta(item).className}`}>{getBlockResultMeta(item).label}</div>
                             <Button variant="outline" onClick={() => openBlockResolution(item)}>DURUM GÜNCELLE</Button>
                           </div>
                         ))
@@ -1722,7 +2170,11 @@ export default function App() {
         </div>
       </Modal>
 
-      <Modal open={blockDialogOpen} onClose={() => setBlockDialogOpen(false)} title="BLOKE DURUMU" maxWidth="max-w-xl">
+      <Modal open={blockDialogOpen} onClose={() => {
+        setBlockDialogOpen(false);
+        setShowResolvedAmountInput(false);
+        setPendingResolveMode('cozuldu');
+      }} title="BLOKE DURUMU" maxWidth="max-w-xl">
         <div className="space-y-4">
           {selectedBlockItem && (
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
@@ -1732,9 +2184,17 @@ export default function App() {
           )}
 
           {showResolvedAmountInput && (
-            <div>
-              <div className="mb-2 text-sm font-black">Çözülen Tutar</div>
+            <div className="rounded-2xl border border-teal-200 bg-teal-50 p-4">
+              <div className="mb-2 text-sm font-black">ÇÖZÜLEN TUTAR</div>
               <Input type="number" value={resolvedAmountInput} onChange={(e) => setResolvedAmountInput(e.target.value)} />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button onClick={() => setBlockAsResolved(pendingResolveMode)}>KAYDET</Button>
+                <Button variant="outline" onClick={() => {
+                  setShowResolvedAmountInput(false);
+                  setPendingResolveMode('cozuldu');
+                  setResolvedAmountInput(selectedBlockItem ? String(selectedBlockItem.resolvedAmount || selectedBlockItem.amount || 0) : '0');
+                }}>İPTAL</Button>
+              </div>
             </div>
           )}
 
