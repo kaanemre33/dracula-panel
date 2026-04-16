@@ -39,6 +39,7 @@ const APP_TIME_ZONE = 'Europe/Istanbul';
 const STORAGE_USERS = 'set-panel-users-v4';
 const STORAGE_THEME = 'set-panel-theme-v1';
 const STORAGE_BANKS = 'set-panel-banks-v1';
+const STORAGE_CURRENT_USER = 'set-panel-current-user-v1';
 
 const DEFAULT_BANKS = [
   'Ziraat Bankası',
@@ -302,13 +303,25 @@ export default function App() {
 
   const canManage = currentUser?.role === 'admin';
 
+  const ownerVisiblePeople = useMemo(() => {
+    if (canManage) return people;
+    return people.filter((person) => person.createdByUserId === currentUser?.id);
+  }, [canManage, people, currentUser?.id]);
+
+  const visiblePersonIds = useMemo(() => new Set(ownerVisiblePeople.map((person) => person.id)), [ownerVisiblePeople]);
+
   const dailyRows = historyByDay[selectedDay] || [];
   const displayedDailyRows = dailyRows.map((row) => pendingSetRows[row.id] || row);
-  const visibleDailyRows = displayedDailyRows;
-  const visiblePeople = people;
+  const visibleDailyRows = canManage ? displayedDailyRows : displayedDailyRows.filter((row) => visiblePersonIds.has(row.personId));
+  const visiblePeople = ownerVisiblePeople;
   const selectedRows = visibleDailyRows.filter((r) => r.personId === selectedPersonId);
-  const visibleBlockCenter = blockCenter;
-  const activeUsers = users.filter((u) => u.isActive);
+  const visibleBlockCenter = canManage
+    ? blockCenter
+    : blockCenter.filter((item) => {
+        const sourcePersonId = getPersonIdFromRowKey(item.sourceRowKey);
+        return visiblePersonIds.has(sourcePersonId) || ownerVisiblePeople.some((person) => person.fullName === item.personName);
+      });
+  const activeUsers = canManage ? users.filter((u) => u.isActive && !u.isDeleted) : users.filter((u) => u.id === currentUser?.id && u.isActive && !u.isDeleted);
   const typingUsers = []; // intentionally disabled; UI stays passive
 
   const hasUnsavedSetBilgiGirisi = useMemo(() => {
@@ -373,49 +386,19 @@ export default function App() {
     return { label: 'ÇÖZÜLDÜ', className: 'text-teal-700' };
   }
 
-  function buildSourceRowBlockMap(rows, blocks) {
-    const rowIds = new Set((rows || []).map((row) => row.id));
-    const map = new Map();
-    (blocks || []).forEach((item) => {
-      if (item.resultList !== 'merkez') return;
-      if (!item.sourceRowKey || !rowIds.has(item.sourceRowKey)) return;
-      map.set(item.sourceRowKey, item);
-    });
-    return map;
-  }
-
-  function getRowBlockedAmount(row, blockMap) {
-    if (!row) return 0;
-    const totalAmount = Number(row.amount || 0);
-    const linkedBlock = blockMap?.get(row.id);
-    const linkedBlockedAmount = linkedBlock ? getCurrentBlockedAmount(linkedBlock) : 0;
-    if (linkedBlockedAmount > 0) return Math.min(totalAmount, linkedBlockedAmount);
-    if (row.status === 'bloke' || row.status === 'sifre_kilit') return totalAmount;
-    return 0;
-  }
-
-  function getRowAvailableAmount(row, blockMap) {
-    if (!row) return 0;
-    const totalAmount = Number(row.amount || 0);
-    const trackable = row.status === 'aktif' || row.status === 'nfc' || row.status === 'bloke' || row.status === 'sifre_kilit';
-    if (!trackable) return 0;
-    return Math.max(0, totalAmount - getRowBlockedAmount(row, blockMap));
-  }
-
   const groupedTotals = useMemo(() => {
-    const blockMap = buildSourceRowBlockMap(visibleDailyRows, visibleBlockCenter);
+    const positive = visibleDailyRows.filter((r) => r.status === 'aktif' || r.status === 'nfc');
+    const negative = visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit');
     const closedItems = visibleBlockCenter.filter((b) => b.resultList === 'kapandi');
     const activatedItems = visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi');
-    const positiveAmount = visibleDailyRows.reduce((sum, row) => sum + getRowAvailableAmount(row, blockMap), 0);
-    const negativeAmount = visibleDailyRows.reduce((sum, row) => sum + getRowBlockedAmount(row, blockMap), 0);
-    const positiveCount = visibleDailyRows.filter((row) => getRowAvailableAmount(row, blockMap) > 0).length;
-    const negativeCount = visibleDailyRows.filter((row) => getRowBlockedAmount(row, blockMap) > 0).length;
+    const partialBlockedItems = visibleBlockCenter.filter((b) => b.resultList === 'merkez' && getCurrentBlockedAmount(b) > 0);
+    const partialBlockedAmount = partialBlockedItems.reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
 
     return {
-      positiveAmount,
-      positiveCount,
-      negativeAmount,
-      negativeCount,
+      positiveAmount: Math.max(0, positive.reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount),
+      positiveCount: positive.length + activatedItems.length,
+      negativeAmount: negative.reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount,
+      negativeCount: negative.length + partialBlockedItems.length,
       closedCount: closedItems.length,
       closedAmount: closedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0),
       activatedCount: activatedItems.length,
@@ -424,10 +407,13 @@ export default function App() {
   }, [visibleDailyRows, visibleBlockCenter]);
 
   const personTotals = useMemo(() => {
-    const blockMap = buildSourceRowBlockMap(selectedRows, visibleBlockCenter);
-    const totalAmount = selectedRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-    const activeAmount = selectedRows.reduce((sum, row) => sum + getRowAvailableAmount(row, blockMap), 0);
-    const lockedAmount = selectedRows.reduce((sum, row) => sum + getRowBlockedAmount(row, blockMap), 0);
+    const selectedRowIds = new Set(selectedRows.map((row) => row.id));
+    const partialBlockedAmount = visibleBlockCenter
+      .filter((item) => selectedRowIds.has(item.sourceRowKey) && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
+      .reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
+    const totalAmount = selectedRows.reduce((s, r) => s + Number(r.amount || 0), 0);
+    const activeAmount = Math.max(0, selectedRows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount);
+    const lockedAmount = selectedRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount;
     return { totalAmount, activeAmount, lockedAmount, totalCount: selectedRows.length };
   }, [selectedRows, visibleBlockCenter]);
 
@@ -447,57 +433,41 @@ export default function App() {
     };
   }, [visibleBlockCenter]);
 
-  const generalSummaryDetails = useMemo(() => {
-    const blockMap = buildSourceRowBlockMap(visibleDailyRows, visibleBlockCenter);
-    return {
-      positive: visibleDailyRows
-        .map((row) => {
-          const availableAmount = getRowAvailableAmount(row, blockMap);
-          if (availableAmount <= 0) return null;
-          const linkedBlock = blockMap.get(row.id);
-          const blockedAmount = linkedBlock ? getCurrentBlockedAmount(linkedBlock) : 0;
-          return {
-            ...row,
-            amount: availableAmount,
-            status: row.status === 'nfc' ? 'nfc' : 'aktif',
-            note: blockedAmount > 0
-              ? `${row.note || 'Not yok'} • Kısmi bloke: ${formatMoney(blockedAmount)}`
-              : (row.note || 'Not yok'),
-          };
-        })
-        .filter(Boolean),
-      negative: visibleDailyRows
-        .map((row) => {
-          const blockedAmount = getRowBlockedAmount(row, blockMap);
-          if (blockedAmount <= 0) return null;
-          const linkedBlock = blockMap.get(row.id);
-          return {
-            ...row,
-            amount: blockedAmount,
-            status: linkedBlock?.type || row.status,
-            note: linkedBlock
-              ? (blockedAmount < Number(row.amount || 0)
-                  ? `${linkedBlock.note || row.note || 'Not yok'} • Kalan bloke`
-                  : (linkedBlock.note || row.note || 'Not yok'))
-              : (row.note || 'Not yok'),
-            editedBy: row.editedBy || linkedBlock?.createdBy || '',
-            editedAt: row.editedAt || linkedBlock?.date || '',
-          };
-        })
-        .filter(Boolean),
-      activated: visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi'),
-      closed: visibleBlockCenter.filter((b) => b.resultList === 'kapandi'),
-    };
-  }, [visibleDailyRows, visibleBlockCenter]);
+  const generalSummaryDetails = useMemo(() => ({
+    positive: visibleDailyRows
+      .filter((r) => r.status === 'aktif' || r.status === 'nfc')
+      .map((row) => {
+        const blockItem = visibleBlockCenter.find((item) => item.sourceRowKey === row.id && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0);
+        if (!blockItem) return row;
+        return { ...row, amount: Math.max(0, Number(row.amount || 0) - getCurrentBlockedAmount(blockItem)), note: `${row.note || 'Not yok'} • Kalan bloke: ${formatMoney(getCurrentBlockedAmount(blockItem))}` };
+      }),
+    negative: [
+      ...visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit'),
+      ...visibleBlockCenter
+        .filter((item) => item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
+        .map((item) => ({
+          personName: item.personName,
+          accountName: item.accountName,
+          amount: getCurrentBlockedAmount(item),
+          status: item.type,
+          note: item.note || 'Kısmi bloke',
+          editedBy: item.createdBy || '',
+          editedAt: item.date || '',
+        })),
+    ],
+    activated: visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi'),
+    closed: visibleBlockCenter.filter((b) => b.resultList === 'kapandi'),
+  }), [visibleDailyRows, visibleBlockCenter]);
 
   const chartDailyTrend = useMemo(() => {
     const keys = Object.keys(historyByDay).sort();
     return keys.slice(-7).map((day) => {
       const rows = historyByDay[day] || [];
-      const dayBlocks = visibleBlockCenter.filter((item) => item.date === day);
-      const blockMap = buildSourceRowBlockMap(rows, dayBlocks);
-      const active = rows.reduce((sum, row) => sum + getRowAvailableAmount(row, blockMap), 0);
-      const blocked = rows.reduce((sum, row) => sum + getRowBlockedAmount(row, blockMap), 0);
+      const partialBlockedAmount = visibleBlockCenter
+        .filter((item) => item.date === day && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
+        .reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
+      const active = Math.max(0, rows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount);
+      const blocked = rows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount;
       return { day: day.slice(5), aktif: active, bloke: blocked };
     });
   }, [historyByDay, visibleBlockCenter]);
@@ -520,17 +490,26 @@ function makeRowKey(day, personId, accountName) {
   return `${day}__${personId}__${accountName}`;
 }
 
+function getPersonIdFromRowKey(rowKey = '') {
+  const parts = String(rowKey || '').split('__');
+  return parts.length >= 3 ? parts[1] : '';
+}
+
 function normalizeUserRecord(row) {
   if (!row) return null;
+  const username = row.username || '';
+  const displayName = row.display_name || row.displayName || username.toUpperCase();
+  const isDeleted = Boolean(row.is_deleted ?? row.isDeleted ?? false) || username.startsWith('__deleted__') || displayName.includes('(SİLİNDİ)');
   return {
     ...row,
     id: row.id,
-    username: row.username || '',
+    username,
     password: row.password || '',
-    displayName: row.display_name || row.displayName || (row.username || '').toUpperCase(),
+    displayName,
     role: row.role || 'user',
     isActive: row.is_active ?? row.isActive ?? true,
     canEnterData: row.can_enter_data ?? row.canEnterData ?? true,
+    isDeleted,
   };
 }
 
@@ -546,6 +525,7 @@ function buildPeopleFromDb(peopleRows = [], accountRows = []) {
       id: row.id,
       fullName: row.full_name,
       startDate: row.start_date || TODAY,
+      createdByUserId: row.created_by || '',
       accountNames: (grouped[row.id] || [])
         .sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0))
         .map((acc) => acc.bank_name),
@@ -608,9 +588,15 @@ function normalizeBlockRecord(row) {
 }
 
 async function loadUsersFromDb() {
-  const { data, error } = await supabase.from('users').select('*').order('created_at', { ascending: true });
+  const { data, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('is_active', true)
+    .order('created_at', { ascending: true });
   if (error) throw error;
-  const normalized = (data || []).map(normalizeUserRecord);
+  const normalized = (data || [])
+    .map(normalizeUserRecord)
+    .filter((user) => user.isActive && !user.isDeleted);
   setUsers(normalized);
   return normalized;
 }
@@ -627,7 +613,7 @@ async function loadSupabaseAppData() {
   setAppLoading(true);
   try {
     const [usersRes, banksRes, peopleRes, accountsRes, txRes, blocksRes] = await Promise.all([
-      supabase.from('users').select('*').order('created_at', { ascending: true }),
+      supabase.from('users').select('*').eq('is_active', true).order('created_at', { ascending: true }),
       supabase.from('banks').select('*').order('name', { ascending: true }),
       supabase.from('people').select('*').order('created_at', { ascending: true }),
       supabase.from('accounts').select('*').order('sort_order', { ascending: true }),
@@ -641,7 +627,9 @@ async function loadSupabaseAppData() {
     if (txRes.error) throw txRes.error;
     if (blocksRes.error) throw blocksRes.error;
 
-    const nextUsers = (usersRes.data || []).map(normalizeUserRecord);
+    const nextUsers = (usersRes.data || [])
+      .map(normalizeUserRecord)
+      .filter((user) => user.isActive && !user.isDeleted);
     const nextBanks = (banksRes.data || []).map((row) => row.name).filter(Boolean);
     const nextPeople = buildPeopleFromDb(peopleRes.data || [], accountsRes.data || []);
     const nextHistory = buildHistoryFromDb(txRes.data || [], nextPeople);
@@ -833,12 +821,20 @@ async function startNewDay() {
       }
 
       const normalizedUser = normalizeUserRecord(data);
+      if (normalizedUser.isDeleted) {
+        showActionNotice('Hata', 'Bu kullanıcı silinmiş durumda.', 'danger');
+        return;
+      }
       if (!normalizedUser.isActive) {
         showActionNotice('Hata', 'Bu kullanıcı pasif durumda.', 'danger');
         return;
       }
 
       setCurrentUser(normalizedUser);
+      try {
+        window.localStorage.setItem(STORAGE_CURRENT_USER, JSON.stringify(normalizedUser));
+        window.history.replaceState({}, '', window.location.pathname);
+      } catch {}
       await loadSupabaseAppData();
     } catch (err) {
       showActionNotice('Hata', err?.message || 'Giriş sırasında hata oluştu.', 'danger');
@@ -954,6 +950,10 @@ async function saveSetDurumu() {
     if (pendingSection) {
       if (pendingSection === 'logout') {
         setPendingSection(null);
+        try {
+          window.localStorage.removeItem(STORAGE_CURRENT_USER);
+          window.history.replaceState({}, '', window.location.pathname);
+        } catch {}
         setCurrentUser(null);
       } else {
         setActiveSection(pendingSection);
@@ -1003,6 +1003,10 @@ async function saveSetDurumu() {
       setNavigationWarningOpen(true);
       return;
     }
+    try {
+      window.localStorage.removeItem(STORAGE_CURRENT_USER);
+      window.history.replaceState({}, '', window.location.pathname);
+    } catch {}
     setCurrentUser(null);
   }
 
@@ -1472,9 +1476,33 @@ async function confirmDeleteUser() {
 
   try {
     setAppLoading(true);
-    const { error } = await supabase.from('users').delete().eq('id', targetId);
+
+    const targetUser = users.find((u) => u.id === targetId);
+    if (!targetUser) throw new Error('Kullanıcı bulunamadı.');
+
+    const payload = {
+      username: targetUser.username,
+      password: targetUser.password,
+      role: targetUser.role,
+      display_name: targetUser.displayName,
+      is_active: false,
+      can_enter_data: false,
+    };
+
+    const { error } = await supabase
+      .from('users')
+      .update(payload)
+      .eq('id', targetId);
+
     if (error) throw error;
-    await loadUsersFromDb();
+
+    const refreshedUsers = await loadUsersFromDb();
+    const stillVisible = (refreshedUsers || []).some((u) => u.id === targetId);
+    if (stillVisible) {
+      throw new Error('Kullanıcı veritabanında pasiflenemedi.');
+    }
+
+    setUsers((prev) => prev.filter((u) => u.id !== targetId));
     setUserPermissionDrafts((prev) => {
       const next = { ...prev };
       delete next[targetId];
@@ -1486,7 +1514,7 @@ async function confirmDeleteUser() {
       return next;
     });
     setDeleteTargetUser(null);
-    showActionNotice('Kullanıcı silindi', `${targetName} sistemden tamamen kaldırıldı.`, 'danger');
+    showActionNotice('Kullanıcı silindi', `${targetName} listeden kaldırıldı.`, 'danger');
   } catch (err) {
     showActionNotice('Hata', err?.message || 'Kullanıcı silinemedi.', 'danger');
   } finally {
@@ -1594,11 +1622,30 @@ useEffect(() => {
 }, []);
 
 useEffect(() => {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_CURRENT_USER);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeUserRecord(parsed);
+    if (normalized && normalized.isActive && !normalized.isDeleted) {
+      setCurrentUser(normalized);
+    }
+  } catch {}
+}, []);
+
+useEffect(() => {
   if (!currentUser) return;
   loadSupabaseAppData().catch((err) => {
     showActionNotice('Hata', err?.message || 'Supabase verileri yüklenemedi.', 'danger');
   });
 }, [currentUser?.id]);
+  useEffect(() => {
+    try {
+      if (currentUser) window.localStorage.setItem(STORAGE_CURRENT_USER, JSON.stringify(currentUser));
+      else window.localStorage.removeItem(STORAGE_CURRENT_USER);
+    } catch {}
+  }, [currentUser]);
+
   useEffect(() => {
     if (!currentUser || !users.length) return;
     const refreshedUser = users.find((u) => u.id === currentUser.id || u.username === currentUser.username);
@@ -1607,14 +1654,14 @@ useEffect(() => {
   }, [users]);
 
   useEffect(() => {
-    if (!people.length) {
+    if (!visiblePeople.length) {
       setSelectedPersonId('');
       return;
     }
-    if (!people.some((p) => p.id === selectedPersonId)) {
-      setSelectedPersonId(people[0].id);
+    if (!visiblePeople.some((p) => p.id === selectedPersonId)) {
+      setSelectedPersonId(visiblePeople[0].id);
     }
-  }, [people, selectedPersonId]);
+  }, [visiblePeople, selectedPersonId]);
 
 
 useEffect(() => {
@@ -1999,7 +2046,7 @@ useEffect(() => {
                     <div className="text-lg font-black">SET LİSTESİ</div>
                     <div className="text-sm text-slate-500">Kartlı hızlı erişim listesi</div>
                   </div>
-                  {people.map((person) => (
+                  {visiblePeople.map((person) => (
                     <div key={person.id} className="rounded-2xl border border-slate-200 bg-white p-4">
                       <div className="flex items-start justify-between gap-4">
                         <div>
@@ -2132,7 +2179,7 @@ useEffect(() => {
               <div>ŞİFRE / İŞLEM</div>
             </div>
             <div className="max-h-[46vh] overflow-auto bg-white">
-              {users.map((u) => (
+              {users.filter((u) => !u.isDeleted).map((u) => (
                 <div key={u.id} className="grid grid-cols-[1.2fr_140px_170px_170px_1.2fr] items-center gap-3 border-t border-slate-200 px-4 py-4">
                   <div className="min-w-0">
                     <div className="truncate font-black text-slate-950">{u.displayName}</div>
