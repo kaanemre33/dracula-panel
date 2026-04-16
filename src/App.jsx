@@ -216,6 +216,37 @@ function getBlockLifecycleState(item) {
   return 'unknown';
 }
 
+function getEffectiveStatusFromBlockItem(item) {
+  const lifecycle = getBlockLifecycleState(item);
+  if (lifecycle === 'activated' || lifecycle === 'resolved') return 'aktif';
+  if (lifecycle === 'closed') return 'pasif';
+  if (lifecycle === 'unresolved') return item.type || 'bloke';
+  return null;
+}
+
+function applyLatestBlockStateToHistory(historyByDay = {}, blockItems = []) {
+  const latestBlockByRowKey = buildLatestBlockMap(blockItems);
+  const next = {};
+
+  Object.entries(historyByDay).forEach(([day, rows]) => {
+    next[day] = (rows || []).map((row) => {
+      const blockItem = latestBlockByRowKey.get(row.id);
+      if (!blockItem) return row;
+
+      const nextStatus = getEffectiveStatusFromBlockItem(blockItem);
+      if (!nextStatus) return row;
+
+      return {
+        ...row,
+        amount: getBlockLifecycleState(blockItem) === 'closed' ? 0 : Number(row.amount || 0),
+        status: nextStatus,
+      };
+    });
+  });
+
+  return next;
+}
+
 function getLatestHistoryDay(historyByDay = {}) {
   const days = Object.keys(historyByDay).sort();
   return days[days.length - 1] || TODAY;
@@ -692,8 +723,8 @@ async function loadSupabaseAppData() {
       .filter((user) => user.isActive && !user.isDeleted);
     const nextBanks = (banksRes.data || []).map((row) => row.name).filter(Boolean);
     const nextPeople = buildPeopleFromDb(peopleRes.data || [], accountsRes.data || []);
-    const nextHistory = buildHistoryFromDb(txRes.data || [], nextPeople);
     const nextBlocks = (blocksRes.data || []).map(normalizeBlockRecord);
+    const nextHistory = applyLatestBlockStateToHistory(buildHistoryFromDb(txRes.data || [], nextPeople), nextBlocks);
 
     setUsers(nextUsers);
     setBankList(nextBanks.length ? nextBanks : DEFAULT_BANKS);
@@ -1642,6 +1673,7 @@ async function setBlockAsResolved(mode = 'cozuldu') {
   }
 
   const finalResolvedAmount = Number(resolvedAmountInput || 0);
+  const now = getTurkeyNow();
   let payload;
   if (mode === 'aktif_alindi') payload = { resolution: 'cozuldu', result_list: 'aktif_alindi', resolved_amount: 0 };
   else if (mode === 'kapandi') payload = { resolution: 'cozuldu', result_list: 'kapandi', resolved_amount: 0 };
@@ -1652,6 +1684,28 @@ async function setBlockAsResolved(mode = 'cozuldu') {
     setAppLoading(true);
     const { error } = await supabase.from('blocks').update(payload).eq('id', selectedBlockItem.id);
     if (error) throw error;
+
+    if (selectedBlockItem.sourceRowKey) {
+      let txPatch = {
+        edited_by: currentUser?.displayName || selectedBlockItem.createdBy || '',
+        edited_at: now.dateTime,
+      };
+
+      if (mode === 'aktif_alindi') {
+        txPatch = { ...txPatch, status: 'aktif' };
+      } else if (mode === 'kapandi') {
+        txPatch = { ...txPatch, status: 'pasif', amount: 0 };
+      } else if (mode === 'cozulmedi') {
+        txPatch = { ...txPatch, status: selectedBlockItem.type || 'bloke' };
+      } else {
+        const isFullyResolved = Math.max(0, Number(finalResolvedAmount || 0)) >= Number(selectedBlockItem.amount || 0);
+        txPatch = { ...txPatch, status: isFullyResolved ? 'aktif' : (selectedBlockItem.type || 'bloke') };
+      }
+
+      const { error: txError } = await supabase.from('transactions').update(txPatch).eq('row_key', selectedBlockItem.sourceRowKey);
+      if (txError) throw txError;
+    }
+
     await loadSupabaseAppData();
     setBlockDialogOpen(false);
     setSelectedBlockItem(null);
