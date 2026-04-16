@@ -268,7 +268,7 @@ export default function App() {
   const [historyByDay, setHistoryByDay] = useState({});
   const [blockCenter, setBlockCenter] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
-  const [login, setLogin] = useState({ username: 'dracula', password: 'Tonymontana.3' });
+  const [login, setLogin] = useState({ username: '', password: '' });
   const [selectedDay, setSelectedDay] = useState(TODAY);
   const [selectedPersonId, setSelectedPersonId] = useState('');
   const [activeSection, setActiveSection] = useState('genel');
