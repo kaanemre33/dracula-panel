@@ -96,6 +96,45 @@ const STATUS_META = {
   bloke: { label: 'BLOKE', className: 'border-rose-200 bg-rose-100 text-rose-800', icon: AlertTriangle },
 };
 
+const VALID_STATUSES = new Set(['pasif', 'aktif', 'nfc', 'sifre_kilit', 'bloke']);
+const STATUS_ALIASES = {
+  active: 'aktif',
+  blocked: 'bloke',
+  block: 'bloke',
+  kilit: 'sifre_kilit',
+  password_lock: 'sifre_kilit',
+  sifre: 'sifre_kilit',
+  sifrekilit: 'sifre_kilit',
+  sifre_kilit: 'sifre_kilit',
+  adam: 'bloke',
+};
+
+function toStatusKey(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[ç]/g, 'c')
+    .replace(/[ğ]/g, 'g')
+    .replace(/[ı]/g, 'i')
+    .replace(/[ö]/g, 'o')
+    .replace(/[ş]/g, 's')
+    .replace(/[ü]/g, 'u')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function normalizeStatus(value, fallback = 'pasif') {
+  const normalized = toStatusKey(value);
+  if (!normalized) return fallback;
+  if (VALID_STATUSES.has(normalized)) return normalized;
+  return STATUS_ALIASES[normalized] || fallback;
+}
+
+function normalizeBlockedStatus(value) {
+  const normalized = normalizeStatus(value, 'bloke');
+  return normalized === 'sifre_kilit' ? 'sifre_kilit' : 'bloke';
+}
+
 const SEED_PEOPLE = [];
 
 const DEFAULT_USERS = [
@@ -165,11 +204,13 @@ function formatMoney(value) {
 }
 
 function isPositiveStatus(status) {
-  return status === 'aktif' || status === 'nfc';
+  const normalized = normalizeStatus(status);
+  return normalized === 'aktif' || normalized === 'nfc';
 }
 
 function isNegativeStatus(status) {
-  return status === 'bloke' || status === 'sifre_kilit';
+  const normalized = normalizeStatus(status);
+  return normalized === 'bloke' || normalized === 'sifre_kilit';
 }
 
 function getResolvedReleaseAmount(item) {
@@ -220,7 +261,7 @@ function getEffectiveStatusFromBlockItem(item) {
   const lifecycle = getBlockLifecycleState(item);
   if (lifecycle === 'activated' || lifecycle === 'resolved') return 'aktif';
   if (lifecycle === 'closed') return 'pasif';
-  if (lifecycle === 'unresolved') return item.type || 'bloke';
+  if (lifecycle === 'unresolved') return normalizeBlockedStatus(item.type);
   return null;
 }
 
@@ -309,7 +350,7 @@ function Modal({ open, title, onClose, children, maxWidth = 'max-w-4xl' }) {
 }
 
 function StatusBadge({ status }) {
-  const meta = STATUS_META[status] || STATUS_META.pasif;
+  const meta = STATUS_META[normalizeStatus(status)] || STATUS_META.pasif;
   const Icon = meta.icon;
   return (
     <span className={`inline-flex items-center gap-1 rounded-full border px-3 py-1 text-xs font-black ${meta.className}`}>
@@ -565,12 +606,20 @@ export default function App() {
 
   const chartStatusMix = useMemo(() => {
     const rows = visibleDailyRows;
+    const getCount = (targetStatus, needsBlockedAmount = false) =>
+      rows.filter((row) => {
+        const sameStatus = normalizeStatus(row.status, 'pasif') === targetStatus;
+        if (!sameStatus) return false;
+        if (!needsBlockedAmount) return true;
+        return getEffectiveNegativeAmount(row, currentDayBlockByRowKey.get(row.id)) > 0;
+      }).length;
+
     return [
-      { name: 'Aktif', value: rows.filter((r) => r.status === 'aktif').length },
-      { name: 'NFC', value: rows.filter((r) => r.status === 'nfc').length },
-      { name: 'Bloke', value: rows.filter((r) => r.status === 'bloke' && getEffectiveNegativeAmount(r, currentDayBlockByRowKey.get(r.id)) > 0).length },
-      { name: 'Şifre Kilit', value: rows.filter((r) => r.status === 'sifre_kilit' && getEffectiveNegativeAmount(r, currentDayBlockByRowKey.get(r.id)) > 0).length },
-      { name: 'Pasif', value: rows.filter((r) => r.status === 'pasif').length },
+      { name: 'Aktif', value: getCount('aktif') },
+      { name: 'NFC', value: getCount('nfc') },
+      { name: 'Bloke', value: getCount('bloke', true) },
+      { name: 'Şifre Kilit', value: getCount('sifre_kilit', true) },
+      { name: 'Pasif', value: getCount('pasif') },
     ];
   }, [visibleDailyRows, currentDayBlockByRowKey]);
 
@@ -650,7 +699,7 @@ function buildHistoryFromDb(transactionRows = [], peopleList = []) {
       personName: row.person_name,
       accountName: row.account_name,
       amount: Number(row.amount || 0),
-      status: row.status || 'pasif',
+      status: normalizeStatus(row.status, 'pasif'),
       note: row.note || '',
       editedBy: row.edited_by || '',
       editedAt: row.edited_at || '',
@@ -668,7 +717,7 @@ function normalizeBlockRecord(row) {
     personName: row.person_name || '',
     accountName: row.account_name || '',
     amount: Number(row.amount || 0),
-    type: row.type || 'bloke',
+    type: normalizeBlockedStatus(row.type),
     note: row.note || '',
     resolution: row.resolution || 'cozulmedi',
     resultList: row.result_list || 'merkez',
@@ -852,11 +901,12 @@ async function startNewDay() {
 
   const sourceRows = historyByDay[selectedDay] || buildZeroRowsForPeople(people, selectedDay);
   const nextDayRows = sourceRows.map((row) => {
+    const normalizedStatus = normalizeStatus(row.status, 'pasif');
     return {
       ...row,
       id: makeRowKey(today, row.personId, row.accountName),
-      amount: row.status === 'aktif' ? 0 : Number(row.amount || 0),
-      status: row.status || 'pasif',
+      amount: normalizedStatus === 'aktif' ? 0 : Number(row.amount || 0),
+      status: normalizedStatus,
       note: row.note || '',
       editedBy: '',
       editedAt: '',
@@ -952,12 +1002,13 @@ async function startNewDay() {
     const currentRow = (historyByDay[selectedDay] || []).find((row) => row.id === rowId);
     const baseRow = pendingSetRows[rowId] || currentRow;
     if (!baseRow) return;
+    const nextValue = key === 'status' ? normalizeStatus(value, 'pasif') : value;
 
     setPendingSetRows((prev) => ({
       ...prev,
       [rowId]: {
         ...baseRow,
-        [key]: value,
+        [key]: nextValue,
         editedBy: currentUser.displayName,
         editedAt: getTurkeyNow().dateTime,
       },
@@ -977,8 +1028,10 @@ async function saveSetDurumu() {
     const nextRow = pendingSetRows[row.id];
     if (!nextRow) return row;
 
-    const wasBlockedBefore = row.status === 'bloke' || row.status === 'sifre_kilit';
-    const isBlockedNow = nextRow.status === 'bloke' || nextRow.status === 'sifre_kilit';
+    const previousStatus = normalizeStatus(row.status, 'pasif');
+    const nextStatus = normalizeStatus(nextRow.status, 'pasif');
+    const wasBlockedBefore = previousStatus === 'bloke' || previousStatus === 'sifre_kilit';
+    const isBlockedNow = nextStatus === 'bloke' || nextStatus === 'sifre_kilit';
     const sourceRowKey = makeRowKey(selectedDay, nextRow.personId, nextRow.accountName);
     if (!wasBlockedBefore && isBlockedNow) {
       const exists = blockCenter.some((b) => b.sourceRowKey === sourceRowKey && b.resultList === 'merkez');
@@ -989,7 +1042,7 @@ async function saveSetDurumu() {
           personName: nextRow.personName,
           accountName: nextRow.accountName,
           amount: Number(nextRow.amount || 0),
-          type: nextRow.status,
+          type: normalizeBlockedStatus(nextStatus),
           note: nextRow.note || '',
           resolution: 'cozulmedi',
           resultList: 'merkez',
@@ -1001,6 +1054,7 @@ async function saveSetDurumu() {
 
     return {
       ...nextRow,
+      status: nextStatus,
       editedBy: nextRow.editedBy || currentUser.displayName,
       editedAt: nextRow.editedAt || now.dateTime,
     };
@@ -1013,7 +1067,7 @@ async function saveSetDurumu() {
     person_name: row.personName,
     account_name: row.accountName,
     amount: Number(row.amount || 0),
-    status: row.status || 'pasif',
+    status: normalizeStatus(row.status, 'pasif'),
     note: row.note || '',
     edited_by: row.editedBy || currentUser.displayName,
     edited_at: row.editedAt || now.dateTime,
@@ -1031,7 +1085,7 @@ async function saveSetDurumu() {
         person_name: item.personName,
         account_name: item.accountName,
         amount: Number(item.amount || 0),
-        type: item.type,
+        type: normalizeBlockedStatus(item.type),
         note: item.note || '',
         resolution: item.resolution,
         result_list: item.resultList,
@@ -1357,7 +1411,7 @@ async function removeCustomBank(bankName) {
               person_name: nextFullName,
               account_name: accountName,
               amount: Number(oldRow?.amount || 0),
-              status: oldRow?.status || 'pasif',
+              status: normalizeStatus(oldRow?.status, 'pasif'),
               note: oldRow?.note || '',
               edited_by: oldRow?.editedBy || '',
               edited_at: oldRow?.editedAt || '',
@@ -1686,6 +1740,7 @@ async function setBlockAsResolved(mode = 'cozuldu') {
     if (error) throw error;
 
     if (selectedBlockItem.sourceRowKey) {
+      const blockedStatus = normalizeBlockedStatus(selectedBlockItem.type);
       let txPatch = {
         edited_by: currentUser?.displayName || selectedBlockItem.createdBy || '',
         edited_at: now.dateTime,
@@ -1696,10 +1751,10 @@ async function setBlockAsResolved(mode = 'cozuldu') {
       } else if (mode === 'kapandi') {
         txPatch = { ...txPatch, status: 'pasif', amount: 0 };
       } else if (mode === 'cozulmedi') {
-        txPatch = { ...txPatch, status: selectedBlockItem.type || 'bloke' };
+        txPatch = { ...txPatch, status: blockedStatus };
       } else {
         const isFullyResolved = Math.max(0, Number(finalResolvedAmount || 0)) >= Number(selectedBlockItem.amount || 0);
-        txPatch = { ...txPatch, status: isFullyResolved ? 'aktif' : (selectedBlockItem.type || 'bloke') };
+        txPatch = { ...txPatch, status: isFullyResolved ? 'aktif' : blockedStatus };
       }
 
       const { error: txError } = await supabase.from('transactions').update(txPatch).eq('row_key', selectedBlockItem.sourceRowKey);
@@ -2031,11 +2086,12 @@ useEffect(() => {
                       {selectedRows.map((row) => {
                         const isPending = !!pendingSetRows[row.id];
                         const liveRow = pendingSetRows[row.id] || row;
+                        const liveStatus = normalizeStatus(liveRow.status, 'pasif');
                         return (
                           <div key={row.id} className={`grid grid-cols-[1.2fr_140px_180px_1fr_170px_220px] items-center gap-3 border-t border-slate-200 px-4 py-3 transition ${isPending ? 'bg-amber-50' : 'bg-white hover:bg-slate-50'}`}>
                             <div className="font-black text-slate-900">{liveRow.accountName}</div>
                             <Input type="number" value={liveRow.amount} onChange={(e) => updateRow(row.id, 'amount', e.target.value)} className="font-bold" />
-                            <SelectBox value={liveRow.status} onChange={(e) => updateRow(row.id, 'status', e.target.value)} className="font-bold">
+                            <SelectBox value={liveStatus} onChange={(e) => updateRow(row.id, 'status', e.target.value)} className="font-bold">
                               <option value="pasif">PASİF</option>
                               <option value="aktif">AKTİF</option>
                               <option value="nfc">NFC</option>
@@ -2043,7 +2099,7 @@ useEffect(() => {
                               <option value="bloke">BLOKE</option>
                             </SelectBox>
                             <Input value={liveRow.note} onChange={(e) => updateRow(row.id, 'note', e.target.value)} placeholder="Not" className="font-bold" />
-                            <div><StatusBadge status={liveRow.status} /></div>
+                            <div><StatusBadge status={liveStatus} /></div>
                             <div className="rounded-xl bg-slate-50 px-3 py-2 text-right">
                               <div className="text-sm font-black text-slate-900">{liveRow.editedBy || currentUser?.displayName || '-'}</div>
                               <div className="text-xs font-bold text-slate-500">{liveRow.editedAt || '-'}</div>
