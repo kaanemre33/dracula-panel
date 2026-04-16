@@ -175,8 +175,7 @@ function isNegativeStatus(status) {
 function getResolvedReleaseAmount(item) {
   if (!item) return 0;
   const totalAmount = Number(item.amount || 0);
-  if (item.resultList === 'kapandi') return 0;
-  if (item.resultList === 'aktif_alindi') return totalAmount;
+  if (item.resultList === 'kapandi' || item.resultList === 'aktif_alindi') return 0;
   if (item.resultList !== 'merkez' || item.resolution !== 'cozuldu') return 0;
   return Math.max(0, Math.min(totalAmount, Number(item.resolvedAmount || 0)));
 }
@@ -206,6 +205,15 @@ function buildLatestBlockMap(blockItems = []) {
     next.set(item.sourceRowKey, item);
   });
   return next;
+}
+
+function getBlockLifecycleState(item) {
+  if (!item) return 'unknown';
+  if (item.resultList === 'aktif_alindi') return 'activated';
+  if (item.resultList === 'kapandi') return 'closed';
+  if (getCurrentBlockedAmount(item) > 0) return 'unresolved';
+  if (item.resultList === 'merkez' && item.resolution === 'cozuldu') return 'resolved';
+  return 'unknown';
 }
 
 function getLatestHistoryDay(historyByDay = {}) {
@@ -370,6 +378,14 @@ export default function App() {
         const sourcePersonId = getPersonIdFromRowKey(item.sourceRowKey);
         return visiblePersonIds.has(sourcePersonId) || ownerVisiblePeople.some((person) => person.fullName === item.personName);
       });
+  const visibleRowKeySet = useMemo(() => new Set(visibleDailyRows.map((row) => row.id)), [visibleDailyRows]);
+  const latestVisibleBlockByRowKey = useMemo(() => buildLatestBlockMap(visibleBlockCenter), [visibleBlockCenter]);
+  const latestVisibleBlockItems = useMemo(() => Array.from(latestVisibleBlockByRowKey.values()), [latestVisibleBlockByRowKey]);
+  const currentDayBlockItems = useMemo(
+    () => latestVisibleBlockItems.filter((item) => visibleRowKeySet.has(item.sourceRowKey)),
+    [latestVisibleBlockItems, visibleRowKeySet]
+  );
+  const currentDayBlockByRowKey = useMemo(() => buildLatestBlockMap(currentDayBlockItems), [currentDayBlockItems]);
   const activeUsers = canManage ? users.filter((u) => u.isActive && !u.isDeleted) : users.filter((u) => u.id === currentUser?.id && u.isActive && !u.isDeleted);
   const typingUsers = []; // intentionally disabled; UI stays passive
 
@@ -416,18 +432,16 @@ export default function App() {
     return { label: 'ÇÖZÜLDÜ', className: 'text-teal-700' };
   }
 
-  const latestVisibleBlockByRowKey = useMemo(() => buildLatestBlockMap(visibleBlockCenter), [visibleBlockCenter]);
-
   const groupedTotals = useMemo(() => {
     const positive = visibleDailyRows.filter((row) => isPositiveStatus(row.status));
     const negativeRows = visibleDailyRows
       .filter((row) => isNegativeStatus(row.status))
       .map((row) => ({
         ...row,
-        effectiveAmount: getEffectiveNegativeAmount(row, latestVisibleBlockByRowKey.get(row.id)),
+        effectiveAmount: getEffectiveNegativeAmount(row, currentDayBlockByRowKey.get(row.id)),
       }));
-    const closedItems = visibleBlockCenter.filter((item) => item.resultList === 'kapandi');
-    const activatedItems = visibleBlockCenter.filter((item) => item.resultList === 'aktif_alindi');
+    const closedItems = currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'closed');
+    const activatedItems = currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'activated');
 
     return {
       positiveAmount: positive.reduce((sum, row) => sum + Number(row.amount || 0), 0),
@@ -439,7 +453,7 @@ export default function App() {
       activatedCount: activatedItems.length,
       activatedAmount: activatedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0),
     };
-  }, [visibleDailyRows, visibleBlockCenter, latestVisibleBlockByRowKey]);
+  }, [visibleDailyRows, currentDayBlockItems, currentDayBlockByRowKey]);
 
   const personTotals = useMemo(() => {
     const totalAmount = selectedRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
@@ -447,34 +461,45 @@ export default function App() {
       .filter((row) => isPositiveStatus(row.status))
       .reduce((sum, row) => sum + Number(row.amount || 0), 0);
     const lockedAmount = selectedRows.reduce(
-      (sum, row) => sum + getEffectiveNegativeAmount(row, latestVisibleBlockByRowKey.get(row.id)),
+      (sum, row) => sum + getEffectiveNegativeAmount(row, currentDayBlockByRowKey.get(row.id)),
       0
     );
     return { totalAmount, activeAmount, lockedAmount, totalCount: selectedRows.length };
-  }, [selectedRows, latestVisibleBlockByRowKey]);
+  }, [selectedRows, currentDayBlockByRowKey]);
 
   const filteredBlockCenter = useMemo(() => {
-    if (!filter.trim()) return visibleBlockCenter;
-    return visibleBlockCenter.filter((b) => `${b.personName} ${b.accountName} ${b.note} ${b.type}`.toLowerCase().includes(filter.toLowerCase()));
-  }, [visibleBlockCenter, filter]);
+    if (!filter.trim()) return latestVisibleBlockItems;
+    return latestVisibleBlockItems.filter((b) =>
+      `${b.personName} ${b.accountName} ${b.note} ${b.type} ${b.resultList} ${b.resolution}`.toLowerCase().includes(filter.toLowerCase())
+    );
+  }, [latestVisibleBlockItems, filter]);
+
+  const blockTableRows = useMemo(
+    () => filteredBlockCenter.filter((item) => getBlockLifecycleState(item) === 'unresolved'),
+    [filteredBlockCenter]
+  );
 
   const blockSummary = useMemo(() => {
-    const unresolvedItems = visibleBlockCenter.filter((item) => getCurrentBlockedAmount(item) > 0);
-    const resolvedItems = visibleBlockCenter.filter((item) => getResolvedReleaseAmount(item) > 0);
+    const unresolvedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'unresolved');
+    const resolvedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'resolved');
+    const closedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'closed');
+    const activatedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'activated');
     return {
       resolvedCount: resolvedItems.length,
       resolvedAmount: resolvedItems.reduce((sum, item) => sum + getResolvedReleaseAmount(item), 0),
       unresolvedCount: unresolvedItems.length,
       unresolvedAmount: unresolvedItems.reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0),
+      closedCount: closedItems.length,
+      activatedCount: activatedItems.length,
     };
-  }, [visibleBlockCenter]);
+  }, [latestVisibleBlockItems]);
 
   const generalSummaryDetails = useMemo(() => ({
     positive: visibleDailyRows.filter((row) => isPositiveStatus(row.status)),
     negative: visibleDailyRows
       .filter((row) => isNegativeStatus(row.status))
       .map((row) => {
-        const blockItem = latestVisibleBlockByRowKey.get(row.id);
+        const blockItem = currentDayBlockByRowKey.get(row.id);
         const effectiveAmount = getEffectiveNegativeAmount(row, blockItem);
         if (!effectiveAmount) return null;
         if (!blockItem || effectiveAmount === Number(row.amount || 0)) {
@@ -487,9 +512,9 @@ export default function App() {
         };
       })
       .filter(Boolean),
-    activated: visibleBlockCenter.filter((item) => item.resultList === 'aktif_alindi'),
-    closed: visibleBlockCenter.filter((item) => item.resultList === 'kapandi'),
-  }), [visibleDailyRows, visibleBlockCenter, latestVisibleBlockByRowKey]);
+    activated: currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'activated'),
+    closed: currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'closed'),
+  }), [visibleDailyRows, currentDayBlockItems, currentDayBlockByRowKey]);
 
   const chartDailyTrend = useMemo(() => {
     const keys = Object.keys(historyByDay).sort();
@@ -512,11 +537,11 @@ export default function App() {
     return [
       { name: 'Aktif', value: rows.filter((r) => r.status === 'aktif').length },
       { name: 'NFC', value: rows.filter((r) => r.status === 'nfc').length },
-      { name: 'Bloke', value: rows.filter((r) => r.status === 'bloke').length },
-      { name: 'Şifre Kilit', value: rows.filter((r) => r.status === 'sifre_kilit').length },
+      { name: 'Bloke', value: rows.filter((r) => r.status === 'bloke' && getEffectiveNegativeAmount(r, currentDayBlockByRowKey.get(r.id)) > 0).length },
+      { name: 'Şifre Kilit', value: rows.filter((r) => r.status === 'sifre_kilit' && getEffectiveNegativeAmount(r, currentDayBlockByRowKey.get(r.id)) > 0).length },
       { name: 'Pasif', value: rows.filter((r) => r.status === 'pasif').length },
     ];
-  }, [visibleDailyRows]);
+  }, [visibleDailyRows, currentDayBlockByRowKey]);
 
   const pieColors = ['#0f766e', '#0891b2', '#e11d48', '#d97706', '#94a3b8'];
 
@@ -730,7 +755,7 @@ async function loadSupabaseAppData() {
     doc.setFontSize(18);
     doc.text('BLOKE MERKEZI RAPORU', 14, 20);
 
-    if (filteredBlockCenter.length === 0) {
+    if (blockTableRows.length === 0) {
       doc.setFontSize(11);
       doc.text('Kayit yok.', 14, 32);
       doc.save(`bloke-merkezi-${selectedDay}.pdf`);
@@ -739,8 +764,8 @@ async function loadSupabaseAppData() {
 
     doc.setFontSize(11);
     let y = 34;
-    filteredBlockCenter.forEach((item, index) => {
-      const line = `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(item.amount)} | ${STATUS_META[item.type]?.label || item.type} | ${item.resolution}`;
+    blockTableRows.forEach((item, index) => {
+      const line = `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(getCurrentBlockedAmount(item))} | ${STATUS_META[item.type]?.label || item.type} | ${item.resolution}`;
       doc.text(line, 14, y);
       y += 8;
       if (y > 280) {
@@ -752,11 +777,11 @@ async function loadSupabaseAppData() {
   }
 
   function handleBlockExportExcel() {
-    const rows = filteredBlockCenter.map((item) => ({
+    const rows = blockTableRows.map((item) => ({
       Tarih: item.date,
       Sahis: item.personName,
       Hesap: item.accountName,
-      Tutar: Number(item.amount || 0),
+      Tutar: Number(getCurrentBlockedAmount(item) || 0),
       Durum: STATUS_META[item.type]?.label || item.type,
       Not: item.note || '',
       Cozum: item.resolution,
@@ -2124,15 +2149,15 @@ useEffect(() => {
               <div className="grid gap-4 xl:grid-cols-4">
                 <SummaryCard title="AÇIK BLOKE SAYISI" value={blockSummary.unresolvedCount} subtitle={`Toplam bloke: ${formatMoney(blockSummary.unresolvedAmount)}`} tone="rose" />
                 <SummaryCard title="ÇÖZÜLEN BLOKE SAYISI" value={blockSummary.resolvedCount} subtitle={`Çözülen bakiye: ${formatMoney(blockSummary.resolvedAmount)}`} tone="cyan" />
-                <SummaryCard title="KAPANAN HESAPLAR" value={visibleBlockCenter.filter((b) => b.resultList === 'kapandi').length} subtitle="Ayrı listede" tone="slate" />
-                <SummaryCard title="AKTİFE ALINANLAR" value={visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi').length} subtitle="Ayrı listede" tone="teal" />
+                <SummaryCard title="KAPANAN HESAPLAR" value={blockSummary.closedCount} subtitle="Son durum kapanan" tone="slate" />
+                <SummaryCard title="AKTİFE ALINANLAR" value={blockSummary.activatedCount} subtitle="Son durum aktife alınan" tone="teal" />
               </div>
 
               <Card>
                 <div className="space-y-4 p-6">
                   <div>
                     <div className="text-lg font-black">BLOKE MERKEZİ</div>
-                    <div className="text-sm text-slate-500">Tüm günlerdeki bloke kayıtları burada tutulur</div>
+                    <div className="text-sm text-slate-500">Açık bloke kayıtlarının son durum listesi burada tutulur</div>
                   </div>
                   <div className="flex flex-wrap items-end justify-between gap-4">
                     <div className="max-w-md flex-1">
@@ -2157,16 +2182,16 @@ useEffect(() => {
                       <div>İŞLEM</div>
                     </div>
                     <div className="max-h-[520px] overflow-auto">
-                      {filteredBlockCenter.length === 0 ? (
+                      {blockTableRows.length === 0 ? (
                         <div className="p-8 text-center text-sm font-bold text-slate-500">KAYIT YOK</div>
                       ) : (
-                        filteredBlockCenter.map((item) => (
+                        blockTableRows.map((item) => (
                           <div key={item.id} className="grid grid-cols-[1.4fr_160px_160px_180px_150px] items-center gap-3 border-t border-slate-200 px-4 py-3 hover:bg-slate-50">
                             <div>
                               <div className="font-black text-slate-950">{item.personName} • {item.accountName}</div>
                               <div className="text-xs font-bold text-slate-500">{item.date} • {item.createdBy} • {item.note || 'Not yok'}</div>
                             </div>
-                            <div className="font-black text-slate-900">{formatMoney(getCurrentBlockedAmount(item) > 0 ? getCurrentBlockedAmount(item) : item.amount)}</div>
+                            <div className="font-black text-slate-900">{formatMoney(getCurrentBlockedAmount(item))}</div>
                             <div><StatusBadge status={item.type} /></div>
                             <div className={`font-black ${getBlockResultMeta(item).className}`}>{getBlockResultMeta(item).label}</div>
                             <Button variant="outline" onClick={() => openBlockResolution(item)}>DURUM GÜNCELLE</Button>
