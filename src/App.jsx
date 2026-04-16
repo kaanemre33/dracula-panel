@@ -842,14 +842,23 @@ async function startNewDay() {
     try {
       const username = String(login.username || '').trim().toLowerCase();
       const password = String(login.password || '').trim();
+      if (!username || !password) {
+        showActionNotice('Hata', 'Kullanıcı adı ve şifre zorunludur.', 'danger');
+        return;
+      }
       const { data, error } = await supabase
         .from('users')
         .select('*')
         .eq('username', username)
-        .eq('password', password)
-        .single();
+        .maybeSingle();
 
       if (error || !data) {
+        showActionNotice('Hata', 'Giriş bilgileri hatalı.', 'danger');
+        return;
+      }
+
+      const savedPassword = String(data.password || '').trim();
+      if (savedPassword !== password) {
         showActionNotice('Hata', 'Giriş bilgileri hatalı.', 'danger');
         return;
       }
