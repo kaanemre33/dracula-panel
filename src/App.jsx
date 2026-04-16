@@ -373,19 +373,49 @@ export default function App() {
     return { label: 'ÇÖZÜLDÜ', className: 'text-teal-700' };
   }
 
+  function buildSourceRowBlockMap(rows, blocks) {
+    const rowIds = new Set((rows || []).map((row) => row.id));
+    const map = new Map();
+    (blocks || []).forEach((item) => {
+      if (item.resultList !== 'merkez') return;
+      if (!item.sourceRowKey || !rowIds.has(item.sourceRowKey)) return;
+      map.set(item.sourceRowKey, item);
+    });
+    return map;
+  }
+
+  function getRowBlockedAmount(row, blockMap) {
+    if (!row) return 0;
+    const totalAmount = Number(row.amount || 0);
+    const linkedBlock = blockMap?.get(row.id);
+    const linkedBlockedAmount = linkedBlock ? getCurrentBlockedAmount(linkedBlock) : 0;
+    if (linkedBlockedAmount > 0) return Math.min(totalAmount, linkedBlockedAmount);
+    if (row.status === 'bloke' || row.status === 'sifre_kilit') return totalAmount;
+    return 0;
+  }
+
+  function getRowAvailableAmount(row, blockMap) {
+    if (!row) return 0;
+    const totalAmount = Number(row.amount || 0);
+    const trackable = row.status === 'aktif' || row.status === 'nfc' || row.status === 'bloke' || row.status === 'sifre_kilit';
+    if (!trackable) return 0;
+    return Math.max(0, totalAmount - getRowBlockedAmount(row, blockMap));
+  }
+
   const groupedTotals = useMemo(() => {
-    const positive = visibleDailyRows.filter((r) => r.status === 'aktif' || r.status === 'nfc');
-    const negative = visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit');
+    const blockMap = buildSourceRowBlockMap(visibleDailyRows, visibleBlockCenter);
     const closedItems = visibleBlockCenter.filter((b) => b.resultList === 'kapandi');
     const activatedItems = visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi');
-    const partialBlockedItems = visibleBlockCenter.filter((b) => b.resultList === 'merkez' && getCurrentBlockedAmount(b) > 0);
-    const partialBlockedAmount = partialBlockedItems.reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
+    const positiveAmount = visibleDailyRows.reduce((sum, row) => sum + getRowAvailableAmount(row, blockMap), 0);
+    const negativeAmount = visibleDailyRows.reduce((sum, row) => sum + getRowBlockedAmount(row, blockMap), 0);
+    const positiveCount = visibleDailyRows.filter((row) => getRowAvailableAmount(row, blockMap) > 0).length;
+    const negativeCount = visibleDailyRows.filter((row) => getRowBlockedAmount(row, blockMap) > 0).length;
 
     return {
-      positiveAmount: Math.max(0, positive.reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount),
-      positiveCount: positive.length + activatedItems.length,
-      negativeAmount: negative.reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount,
-      negativeCount: negative.length + partialBlockedItems.length,
+      positiveAmount,
+      positiveCount,
+      negativeAmount,
+      negativeCount,
       closedCount: closedItems.length,
       closedAmount: closedItems.reduce((sum, item) => sum + Number(item.amount || 0), 0),
       activatedCount: activatedItems.length,
@@ -394,13 +424,10 @@ export default function App() {
   }, [visibleDailyRows, visibleBlockCenter]);
 
   const personTotals = useMemo(() => {
-    const selectedRowIds = new Set(selectedRows.map((row) => row.id));
-    const partialBlockedAmount = visibleBlockCenter
-      .filter((item) => selectedRowIds.has(item.sourceRowKey) && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
-      .reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
-    const totalAmount = selectedRows.reduce((s, r) => s + Number(r.amount || 0), 0);
-    const activeAmount = Math.max(0, selectedRows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount);
-    const lockedAmount = selectedRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount;
+    const blockMap = buildSourceRowBlockMap(selectedRows, visibleBlockCenter);
+    const totalAmount = selectedRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
+    const activeAmount = selectedRows.reduce((sum, row) => sum + getRowAvailableAmount(row, blockMap), 0);
+    const lockedAmount = selectedRows.reduce((sum, row) => sum + getRowBlockedAmount(row, blockMap), 0);
     return { totalAmount, activeAmount, lockedAmount, totalCount: selectedRows.length };
   }, [selectedRows, visibleBlockCenter]);
 
@@ -420,41 +447,57 @@ export default function App() {
     };
   }, [visibleBlockCenter]);
 
-  const generalSummaryDetails = useMemo(() => ({
-    positive: visibleDailyRows
-      .filter((r) => r.status === 'aktif' || r.status === 'nfc')
-      .map((row) => {
-        const blockItem = visibleBlockCenter.find((item) => item.sourceRowKey === row.id && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0);
-        if (!blockItem) return row;
-        return { ...row, amount: Math.max(0, Number(row.amount || 0) - getCurrentBlockedAmount(blockItem)), note: `${row.note || 'Not yok'} • Kalan bloke: ${formatMoney(getCurrentBlockedAmount(blockItem))}` };
-      }),
-    negative: [
-      ...visibleDailyRows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit'),
-      ...visibleBlockCenter
-        .filter((item) => item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
-        .map((item) => ({
-          personName: item.personName,
-          accountName: item.accountName,
-          amount: getCurrentBlockedAmount(item),
-          status: item.type,
-          note: item.note || 'Kısmi bloke',
-          editedBy: item.createdBy || '',
-          editedAt: item.date || '',
-        })),
-    ],
-    activated: visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi'),
-    closed: visibleBlockCenter.filter((b) => b.resultList === 'kapandi'),
-  }), [visibleDailyRows, visibleBlockCenter]);
+  const generalSummaryDetails = useMemo(() => {
+    const blockMap = buildSourceRowBlockMap(visibleDailyRows, visibleBlockCenter);
+    return {
+      positive: visibleDailyRows
+        .map((row) => {
+          const availableAmount = getRowAvailableAmount(row, blockMap);
+          if (availableAmount <= 0) return null;
+          const linkedBlock = blockMap.get(row.id);
+          const blockedAmount = linkedBlock ? getCurrentBlockedAmount(linkedBlock) : 0;
+          return {
+            ...row,
+            amount: availableAmount,
+            status: row.status === 'nfc' ? 'nfc' : 'aktif',
+            note: blockedAmount > 0
+              ? `${row.note || 'Not yok'} • Kısmi bloke: ${formatMoney(blockedAmount)}`
+              : (row.note || 'Not yok'),
+          };
+        })
+        .filter(Boolean),
+      negative: visibleDailyRows
+        .map((row) => {
+          const blockedAmount = getRowBlockedAmount(row, blockMap);
+          if (blockedAmount <= 0) return null;
+          const linkedBlock = blockMap.get(row.id);
+          return {
+            ...row,
+            amount: blockedAmount,
+            status: linkedBlock?.type || row.status,
+            note: linkedBlock
+              ? (blockedAmount < Number(row.amount || 0)
+                  ? `${linkedBlock.note || row.note || 'Not yok'} • Kalan bloke`
+                  : (linkedBlock.note || row.note || 'Not yok'))
+              : (row.note || 'Not yok'),
+            editedBy: row.editedBy || linkedBlock?.createdBy || '',
+            editedAt: row.editedAt || linkedBlock?.date || '',
+          };
+        })
+        .filter(Boolean),
+      activated: visibleBlockCenter.filter((b) => b.resultList === 'aktif_alindi'),
+      closed: visibleBlockCenter.filter((b) => b.resultList === 'kapandi'),
+    };
+  }, [visibleDailyRows, visibleBlockCenter]);
 
   const chartDailyTrend = useMemo(() => {
     const keys = Object.keys(historyByDay).sort();
     return keys.slice(-7).map((day) => {
       const rows = historyByDay[day] || [];
-      const partialBlockedAmount = visibleBlockCenter
-        .filter((item) => item.date === day && item.resultList === 'merkez' && getCurrentBlockedAmount(item) > 0)
-        .reduce((sum, item) => sum + getCurrentBlockedAmount(item), 0);
-      const active = Math.max(0, rows.filter((r) => r.status === 'aktif' || r.status === 'nfc').reduce((s, r) => s + Number(r.amount || 0), 0) - partialBlockedAmount);
-      const blocked = rows.filter((r) => r.status === 'bloke' || r.status === 'sifre_kilit').reduce((s, r) => s + Number(r.amount || 0), 0) + partialBlockedAmount;
+      const dayBlocks = visibleBlockCenter.filter((item) => item.date === day);
+      const blockMap = buildSourceRowBlockMap(rows, dayBlocks);
+      const active = rows.reduce((sum, row) => sum + getRowAvailableAmount(row, blockMap), 0);
+      const blocked = rows.reduce((sum, row) => sum + getRowBlockedAmount(row, blockMap), 0);
       return { day: day.slice(5), aktif: active, bloke: blocked };
     });
   }, [historyByDay, visibleBlockCenter]);
