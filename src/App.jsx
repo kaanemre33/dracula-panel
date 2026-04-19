@@ -1,21 +1,17 @@
 import { supabase } from './supabase'
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BadgeCheck,
   Ban,
   BellRing,
-  Download,
   FileSpreadsheet,
   FileText,
   LayoutDashboard,
-  Lock,
   PieChart as PieChartIcon,
   Plus,
   Search,
-  Settings,
   ShieldCheck,
-  Smartphone,
   Trash2,
   UserRound,
   Pencil,
@@ -34,12 +30,44 @@ import {
 } from 'recharts';
 import jsPDF from 'jspdf';
 import * as XLSX from 'xlsx';
+import { useOnlineUsers } from './hooks/useOnlineUsers';
+import {
+  STATUS_META as SHARED_STATUS_META,
+  STATUS_SELECT_OPTIONS,
+  getStatusLabel as getStatusLabelLib,
+  isManagerLockedStatus as isManagerLockedStatusLib,
+  isNegativeStatus as isNegativeStatusLib,
+  isPositiveStatus as isPositiveStatusLib,
+  normalizeBlockedStatus as normalizeBlockedStatusLib,
+  normalizeStatus as normalizeStatusLib,
+  shouldRepairBlockStatus,
+  shouldRepairTransactionStatus,
+} from './lib/status';
+import {
+  SETCI_PAYMENT_RESULT,
+  SET_PAYMENT_RESULT,
+  buildSetPaymentSourceKey as buildSetPaymentSourceKeyLib,
+  buildSetciPaymentSourceKey as buildSetciPaymentSourceKeyLib,
+  getSetPaymentMonthKey,
+  getSetPaymentMonthLabel,
+  getSetPaymentPersonId,
+  getSetPaymentStatusLabel,
+  isAuditPaymentLog as isAuditPaymentLogLib,
+  isSetPaymentLog as isSetPaymentLogLib,
+  isSetciPaymentLog as isSetciPaymentLogLib,
+} from './lib/payments';
+import { appendStructuredSheet, renderPdfHeader, renderPdfSection } from './lib/exportHelpers';
+import { BlockStatusModal } from './components/BlockStatusModal';
+import { ReportMenu } from './components/ReportMenu';
+import { SetPaymentsPanel } from './components/SetPaymentsPanel';
+import { SetciPaymentModal } from './components/SetciPaymentModal';
+import { Button, Card, Input, Modal, SelectBox, SidebarButton, StatusBadge, SummaryCard } from './components/ui';
 
 const APP_TIME_ZONE = 'Europe/Istanbul';
-const STORAGE_USERS = 'set-panel-users-v4';
 const STORAGE_THEME = 'set-panel-theme-v1';
 const STORAGE_BANKS = 'set-panel-banks-v1';
 const STORAGE_CURRENT_USER = 'set-panel-current-user-v1';
+const STORAGE_REPORT_DAY = 'set-panel-report-day-v1';
 
 const DEFAULT_BANKS = [
   'Ziraat Bankası',
@@ -87,6 +115,8 @@ function getTurkeyNow() {
 
 const TODAY = getTurkeyNow().date;
 const DEFAULT_ACCOUNT_NAMES = DEFAULT_BANKS.slice(0, 5);
+/* legacy inline status block moved to src/lib/status.js
+const STATUS_OPTIONS = ['pasif', 'aktif', 'nfc', 'sifre_kilit', 'bloke'];
 
 const STATUS_META = {
   pasif: { label: 'PASİF', className: 'border-slate-200 bg-slate-100 text-slate-700', icon: Ban },
@@ -106,7 +136,7 @@ const STATUS_ALIASES = {
   sifre: 'sifre_kilit',
   sifrekilit: 'sifre_kilit',
   sifre_kilit: 'sifre_kilit',
-  adam: 'bloke',
+  legacy_invalid_status: 'bloke',
 };
 
 function toStatusKey(value) {
@@ -134,23 +164,20 @@ function normalizeBlockedStatus(value) {
   const normalized = normalizeStatus(value, 'bloke');
   return normalized === 'sifre_kilit' ? 'sifre_kilit' : 'bloke';
 }
+*/
+
+const STATUS_OPTIONS = STATUS_SELECT_OPTIONS.map((item) => item.value);
+const STATUS_META = SHARED_STATUS_META;
+
+function normalizeStatus(value, fallback = 'pasif') {
+  return normalizeStatusLib(value, fallback);
+}
+
+function normalizeBlockedStatus(value) {
+  return normalizeBlockedStatusLib(value);
+}
 
 const SEED_PEOPLE = [];
-
-const DEFAULT_USERS = [
-  { id: 'u1', username: 'admin', password: 'admin123', displayName: 'YÖNETİCİ', role: 'admin', isActive: true, canEnterData: true },
-];
-
-function getStoredUsers() {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_USERS);
-    if (!raw) return DEFAULT_USERS;
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) && parsed.length ? parsed : DEFAULT_USERS;
-  } catch {
-    return DEFAULT_USERS;
-  }
-}
 
 function getStoredTheme() {
   try {
@@ -169,6 +196,22 @@ function getStoredBanks() {
   } catch {
     return DEFAULT_BANKS;
   }
+}
+
+function getStoredReportDay() {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_REPORT_DAY);
+    return /^\d{4}-\d{2}-\d{2}$/.test(String(raw || '')) ? raw : TODAY;
+  } catch {
+    return TODAY;
+  }
+}
+
+function clearStoredCurrentUser() {
+  try {
+    window.localStorage.removeItem(STORAGE_CURRENT_USER);
+    window.history.replaceState({}, '', window.location.pathname);
+  } catch {}
 }
 
 function makeDayRecords(people) {
@@ -203,19 +246,71 @@ function formatMoney(value) {
   }).format(Number(value || 0));
 }
 
+function formatDisplayDateTime(value) {
+  if (!value) return '-';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(value))) return String(value);
+  if (/^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}$/.test(String(value))) return value;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return String(value);
+  return new Intl.DateTimeFormat('tr-TR', {
+    timeZone: APP_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(parsed).replace(',', '');
+}
+
+function normalizeDisplayName(value) {
+  return String(value || '').trim().toLocaleUpperCase('tr-TR');
+}
+
+function normalizeUsername(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .toLocaleLowerCase('en-US');
+}
+
+function getStatusLabel(status) {
+  return getStatusLabelLib(status);
+}
+
+function isManagerLockedStatus(status) {
+  return isManagerLockedStatusLib(status);
+}
+
+function getSectionLabel(section) {
+  if (section === 'genel') return 'Genel Özet';
+  if (section === 'durum') return 'Durum Ayarla';
+  if (section === 'bloke') return 'Bloke Takibi';
+  if (section === 'giris') return 'Set Bilgi Girişi';
+  return 'Panel';
+}
+
+function getSummaryModalTitle(key) {
+  if (key === 'positive') return 'Aktif + NFC Detayları';
+  if (key === 'negative') return 'Bloke + Şifre Kilit Detayları';
+  if (key === 'activated') return 'Aktife Alınan Hesaplar';
+  if (key === 'closed') return 'Kapanan Hesaplar';
+  if (key === 'setci') return 'Setci Odemesi Kayitlari';
+  return 'Detay Liste';
+}
+
 function isPositiveStatus(status) {
-  const normalized = normalizeStatus(status);
-  return normalized === 'aktif' || normalized === 'nfc';
+  return isPositiveStatusLib(status);
 }
 
 function isNegativeStatus(status) {
-  const normalized = normalizeStatus(status);
-  return normalized === 'bloke' || normalized === 'sifre_kilit';
+  return isNegativeStatusLib(status);
 }
 
 function getResolvedReleaseAmount(item) {
   if (!item) return 0;
   const totalAmount = Number(item.amount || 0);
+  if (isAuditPaymentLog(item)) return 0;
   if (item.resultList === 'kapandi' || item.resultList === 'aktif_alindi') return 0;
   if (item.resultList !== 'merkez' || item.resolution !== 'cozuldu') return 0;
   return Math.max(0, Math.min(totalAmount, Number(item.resolvedAmount || 0)));
@@ -223,6 +318,7 @@ function getResolvedReleaseAmount(item) {
 
 function getCurrentBlockedAmount(item) {
   if (!item) return 0;
+  if (isAuditPaymentLog(item)) return 0;
   const totalAmount = Number(item.amount || 0);
   if (item.resultList === 'kapandi' || item.resultList === 'aktif_alindi') return 0;
   if (item.resolution === 'cozulmedi') return totalAmount;
@@ -239,6 +335,48 @@ function getEffectiveNegativeAmount(row, blockItem) {
   return Math.max(0, Math.min(totalAmount, getCurrentBlockedAmount(blockItem)));
 }
 
+function getRowFinancialBreakdown(row, blockItem) {
+  const normalizedStatus = normalizeStatus(row?.status, 'pasif');
+  const baseAmount = Number(row?.amount || 0);
+
+  if (!baseAmount) {
+    return {
+      baseAmount: 0,
+      positiveAmount: 0,
+      negativeAmount: 0,
+      releasedAmount: 0,
+    };
+  }
+
+  if (!isNegativeStatus(normalizedStatus)) {
+    return {
+      baseAmount,
+      positiveAmount: isPositiveStatus(normalizedStatus) ? baseAmount : 0,
+      negativeAmount: 0,
+      releasedAmount: 0,
+    };
+  }
+
+  if (!blockItem) {
+    return {
+      baseAmount,
+      positiveAmount: 0,
+      negativeAmount: baseAmount,
+      releasedAmount: 0,
+    };
+  }
+
+  const releasedAmount = Math.max(0, Math.min(baseAmount, getResolvedReleaseAmount(blockItem)));
+  const negativeAmount = Math.max(0, Math.min(baseAmount, getCurrentBlockedAmount(blockItem)));
+
+  return {
+    baseAmount,
+    positiveAmount: releasedAmount,
+    negativeAmount,
+    releasedAmount,
+  };
+}
+
 function buildLatestBlockMap(blockItems = []) {
   const next = new Map();
   blockItems.forEach((item) => {
@@ -250,11 +388,67 @@ function buildLatestBlockMap(blockItems = []) {
 
 function getBlockLifecycleState(item) {
   if (!item) return 'unknown';
+  if (isAuditPaymentLog(item)) return 'payment';
   if (item.resultList === 'aktif_alindi') return 'activated';
   if (item.resultList === 'kapandi') return 'closed';
   if (getCurrentBlockedAmount(item) > 0) return 'unresolved';
   if (item.resultList === 'merkez' && item.resolution === 'cozuldu') return 'resolved';
   return 'unknown';
+}
+
+/* legacy payment helpers moved to src/lib/payments.js
+function buildSetciPaymentSourceKey(rowKey) {
+  return `setci::${encodeURIComponent(rowKey)}::${Date.now()}`;
+}
+
+function isSetciPaymentLog(item) {
+  return String(item?.resultList || '') === SETCI_PAYMENT_RESULT;
+}
+*/
+
+function buildSetciPaymentSourceKey(rowKey) {
+  return buildSetciPaymentSourceKeyLib(rowKey);
+}
+
+function isSetciPaymentLog(item) {
+  return isSetciPaymentLogLib(item);
+}
+
+function isSetPaymentLog(item) {
+  return isSetPaymentLogLib(item);
+}
+
+function isAuditPaymentLog(item) {
+  return isAuditPaymentLogLib(item);
+}
+
+function buildSetPaymentSourceKey(personId, monthKey = 'month_1') {
+  return buildSetPaymentSourceKeyLib(personId, monthKey);
+}
+
+function buildHistoryRowMap(historyByDay = {}) {
+  const next = new Map();
+  Object.values(historyByDay).forEach((rows) => {
+    (rows || []).forEach((row) => {
+      if (!row?.id) return;
+      next.set(row.id, row);
+    });
+  });
+  return next;
+}
+
+function getBlockCreatedDisplayValue(item) {
+  return formatDisplayDateTime(item?.createdAt || item?.date || '');
+}
+
+function getBlockChangedAt(item, historyRowByKey) {
+  if (!item?.sourceRowKey) return item?.createdAt || item?.date || '';
+  return historyRowByKey.get(item.sourceRowKey)?.editedAt || item?.createdAt || item?.date || '';
+}
+
+function getBlockChangedBy(item, historyRowByKey) {
+  if (!item?.sourceRowKey) return item?.createdBy || '';
+  return historyRowByKey.get(item.sourceRowKey)?.editedBy || item?.createdBy || '';
 }
 
 function getEffectiveStatusFromBlockItem(item) {
@@ -293,6 +487,7 @@ function getLatestHistoryDay(historyByDay = {}) {
   return days[days.length - 1] || TODAY;
 }
 
+/* legacy ui primitives moved to src/components/ui.jsx
 function Button({ children, className = '', variant = 'primary', ...props }) {
   const map = {
     primary: 'bg-slate-900 text-white hover:bg-slate-800 border-slate-900',
@@ -389,6 +584,7 @@ function SidebarButton({ active, icon: Icon, label, onClick }) {
     </button>
   );
 }
+*/
 
 export default function App() {
   const [theme, setTheme] = useState(() => getStoredTheme());
@@ -399,7 +595,7 @@ export default function App() {
   const [blockCenter, setBlockCenter] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
   const [login, setLogin] = useState({ username: '', password: '' });
-  const [selectedDay, setSelectedDay] = useState(TODAY);
+  const [selectedDay, setSelectedDay] = useState(() => getStoredReportDay());
   const [selectedPersonId, setSelectedPersonId] = useState('');
   const [activeSection, setActiveSection] = useState('genel');
   const [filter, setFilter] = useState('');
@@ -411,12 +607,17 @@ export default function App() {
   const [resolvedAmountInput, setResolvedAmountInput] = useState('');
   const [showResolvedAmountInput, setShowResolvedAmountInput] = useState(false);
   const [pendingResolveMode, setPendingResolveMode] = useState('cozuldu');
+  const [blockNoteInput, setBlockNoteInput] = useState('');
+  const [setciPaymentModalOpen, setSetciPaymentModalOpen] = useState(false);
+  const [setciPaymentDraft, setSetciPaymentDraft] = useState({ rowId: '', amount: '', note: '' });
+  const [setPaymentDraft, setSetPaymentDraft] = useState({ month1Status: 'odenmedi', month1Amount: '', month1Note: '' });
   const [notificationModalOpen, setNotificationModalOpen] = useState(false);
+  const [reportMenuOpen, setReportMenuOpen] = useState(false);
   const [newUserForm, setNewUserForm] = useState({ displayName: '', username: '', password: '', role: 'user' });
   const [passwordDrafts, setPasswordDrafts] = useState({});
   const [userPermissionDrafts, setUserPermissionDrafts] = useState({});
   const [newPersonName, setNewPersonName] = useState('');
-  const [newPersonDate, setNewPersonDate] = useState(TODAY);
+  const [newPersonDate, setNewPersonDate] = useState(() => getStoredReportDay());
   const [newAccountCount, setNewAccountCount] = useState('5');
   const [newAccountNames, setNewAccountNames] = useState(DEFAULT_ACCOUNT_NAMES);
   const [appLoading, setAppLoading] = useState(false);
@@ -429,6 +630,8 @@ export default function App() {
   const [deleteSetTarget, setDeleteSetTarget] = useState(null);
   const [editingPersonId, setEditingPersonId] = useState(null);
   const [newBankName, setNewBankName] = useState('');
+  const [dataReady, setDataReady] = useState(false);
+  const reportMenuRef = useRef(null);
 
   const canManage = currentUser?.role === 'admin';
 
@@ -443,7 +646,12 @@ export default function App() {
   const displayedDailyRows = dailyRows.map((row) => pendingSetRows[row.id] || row);
   const visibleDailyRows = canManage ? displayedDailyRows : displayedDailyRows.filter((row) => visiblePersonIds.has(row.personId));
   const visiblePeople = ownerVisiblePeople;
+  const selectedPerson = visiblePeople.find((person) => person.id === selectedPersonId) || null;
   const selectedRows = visibleDailyRows.filter((r) => r.personId === selectedPersonId);
+  const eligibleSetciRows = useMemo(
+    () => selectedRows.filter((row) => isPositiveStatus(row.status) && Number(row.amount || 0) > 0),
+    [selectedRows]
+  );
   const visibleBlockCenter = canManage
     ? blockCenter
     : blockCenter.filter((item) => {
@@ -451,47 +659,115 @@ export default function App() {
         return visiblePersonIds.has(sourcePersonId) || ownerVisiblePeople.some((person) => person.fullName === item.personName);
       });
   const visibleRowKeySet = useMemo(() => new Set(visibleDailyRows.map((row) => row.id)), [visibleDailyRows]);
+  const historyRowByKey = useMemo(() => buildHistoryRowMap(historyByDay), [historyByDay]);
   const latestVisibleBlockByRowKey = useMemo(() => buildLatestBlockMap(visibleBlockCenter), [visibleBlockCenter]);
   const latestVisibleBlockItems = useMemo(() => Array.from(latestVisibleBlockByRowKey.values()), [latestVisibleBlockByRowKey]);
+  const visibleSetciPayments = useMemo(
+    () => visibleBlockCenter.filter((item) => isSetciPaymentLog(item)),
+    [visibleBlockCenter]
+  );
+  const visibleSetPayments = useMemo(
+    () => visibleBlockCenter.filter((item) => isSetPaymentLog(item)),
+    [visibleBlockCenter]
+  );
+  const currentDaySetciPayments = useMemo(
+    () => visibleSetciPayments.filter((item) => item.date === selectedDay),
+    [visibleSetciPayments, selectedDay]
+  );
+  const setPaymentTargetPersonId = editingPersonId || selectedPersonId || '';
+  const setPaymentTargetPerson = useMemo(
+    () => visiblePeople.find((person) => person.id === setPaymentTargetPersonId) || people.find((person) => person.id === setPaymentTargetPersonId) || null,
+    [visiblePeople, people, setPaymentTargetPersonId]
+  );
+  const selectedSetPaymentLogs = useMemo(() => {
+    if (!setPaymentTargetPerson) return [];
+    const personId = setPaymentTargetPerson.id;
+    return visibleSetPayments
+      .filter((item) => getSetPaymentPersonId(item.sourceRowKey) === personId)
+      .sort((left, right) => String(right.createdAt || right.date || '').localeCompare(String(left.createdAt || left.date || '')));
+  }, [setPaymentTargetPerson, visibleSetPayments]);
+  const monthOneSetPayment = useMemo(() => {
+    if (!setPaymentTargetPerson) return null;
+    const sourceKey = buildSetPaymentSourceKey(setPaymentTargetPerson.id, 'month_1');
+    return selectedSetPaymentLogs.find((item) => item.sourceRowKey === sourceKey) || null;
+  }, [selectedSetPaymentLogs, setPaymentTargetPerson]);
   const currentDayBlockItems = useMemo(
     () => latestVisibleBlockItems.filter((item) => visibleRowKeySet.has(item.sourceRowKey)),
     [latestVisibleBlockItems, visibleRowKeySet]
   );
   const currentDayBlockByRowKey = useMemo(() => buildLatestBlockMap(currentDayBlockItems), [currentDayBlockItems]);
+  const derivedCurrentDayBlockItems = useMemo(
+    () =>
+      visibleDailyRows.reduce((items, row) => {
+        const normalizedStatus = normalizeStatus(row.status, 'pasif');
+        if (!isNegativeStatus(normalizedStatus)) return items;
+
+        const latestBlockItem = currentDayBlockByRowKey.get(row.id);
+        if (latestBlockItem && getBlockLifecycleState(latestBlockItem) === 'unresolved') return items;
+
+        items.push({
+          id: `derived-${row.id}`,
+          sourceRowKey: row.id,
+          date: selectedDay,
+          personName: row.personName,
+          accountName: row.accountName,
+          amount: Number(row.amount || 0),
+          type: normalizeBlockedStatus(normalizedStatus),
+          note: row.note || '',
+          resolution: 'cozulmedi',
+          resultList: 'merkez',
+          resolvedAmount: 0,
+          createdBy: row.editedBy || '',
+          createdAt: row.editedAt || selectedDay,
+          isDerived: true,
+        });
+
+        return items;
+      }, []),
+    [visibleDailyRows, currentDayBlockByRowKey, selectedDay]
+  );
+  const mergedBlockCenterItems = useMemo(() => {
+    const actualBlockItems = latestVisibleBlockItems.filter((item) => !isAuditPaymentLog(item));
+    const mergedByRowKey = new Map();
+    const itemsWithoutRowKey = [];
+
+    actualBlockItems.forEach((item) => {
+      if (!item?.sourceRowKey) {
+        itemsWithoutRowKey.push(item);
+        return;
+      }
+      mergedByRowKey.set(item.sourceRowKey, item);
+    });
+
+    derivedCurrentDayBlockItems.forEach((item) => {
+      if (!item?.sourceRowKey) {
+        itemsWithoutRowKey.push(item);
+        return;
+      }
+      mergedByRowKey.set(item.sourceRowKey, item);
+    });
+
+    return [...itemsWithoutRowKey, ...Array.from(mergedByRowKey.values())].sort((left, right) =>
+      String(right.createdAt || right.date || '').localeCompare(String(left.createdAt || left.date || ''))
+    );
+  }, [latestVisibleBlockItems, derivedCurrentDayBlockItems]);
   const activeUsers = canManage ? users.filter((u) => u.isActive && !u.isDeleted) : users.filter((u) => u.id === currentUser?.id && u.isActive && !u.isDeleted);
-  const typingUsers = []; // intentionally disabled; UI stays passive
+  const onlineUsers = useOnlineUsers(currentUser, getSectionLabel(activeSection));
 
   const hasUnsavedSetBilgiGirisi = useMemo(() => {
     const count = Number(newAccountCount || 0);
     const selectedNames = newAccountNames.slice(0, count);
     if (editingPersonId) return false;
     const hasNameStarted = newPersonName.trim().length > 0;
-    const hasDateChanged = newPersonDate !== TODAY;
+    const hasDateChanged = newPersonDate !== selectedDay;
     const hasCountChanged = newAccountCount !== '5';
     const hasCustomNames = selectedNames.some((name, index) => (name || '').trim() !== (DEFAULT_ACCOUNT_NAMES[index] || '').trim());
     return hasNameStarted || hasDateChanged || hasCountChanged || hasCustomNames;
-  }, [newPersonName, newPersonDate, newAccountCount, newAccountNames, editingPersonId]);
-
-  function hasUnsavedUserPanel() {
-    const hasPasswordDraft = Object.values(passwordDrafts).some((value) => String(value || '').trim().length > 0);
-    const hasPermissionDraft = Object.keys(userPermissionDrafts).length > 0;
-    const hasNewUserDraft =
-      String(newUserForm.displayName || '').trim().length > 0 ||
-      String(newUserForm.username || '').trim().length > 0 ||
-      String(newUserForm.password || '').trim().length > 0;
-    return hasPasswordDraft || hasPermissionDraft || hasNewUserDraft;
-  }
+  }, [newPersonName, newPersonDate, newAccountCount, newAccountNames, editingPersonId, selectedDay]);
 
   function hasUnsavedAny() {
     return (activeSection === 'durum' && Object.keys(pendingSetRows).length > 0) ||
-      (activeSection === 'giris' && hasUnsavedSetBilgiGirisi) ||
-      (showUsersPanel && hasUnsavedUserPanel());
-  }
-
-  function getPanelUser(user) {
-    const draft = userPermissionDrafts[user.id];
-    if (!draft) return user;
-    return { ...user, ...draft };
+      (activeSection === 'giris' && hasUnsavedSetBilgiGirisi);
   }
 
   function getBlockResultMeta(item) {
@@ -505,19 +781,32 @@ export default function App() {
   }
 
   const groupedTotals = useMemo(() => {
-    const positive = visibleDailyRows.filter((row) => isPositiveStatus(row.status));
+    const financialRows = visibleDailyRows.map((row) => {
+      const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+      return {
+        ...row,
+        positiveAmount: breakdown.positiveAmount,
+        negativeAmount: breakdown.negativeAmount,
+      };
+    });
     const negativeRows = visibleDailyRows
       .filter((row) => isNegativeStatus(row.status))
-      .map((row) => ({
-        ...row,
-        effectiveAmount: getEffectiveNegativeAmount(row, currentDayBlockByRowKey.get(row.id)),
-      }));
+      .map((row) => {
+        const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+        return {
+          ...row,
+          effectiveAmount: breakdown.negativeAmount,
+        };
+      });
     const closedItems = currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'closed');
     const activatedItems = currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'activated');
 
     return {
-      positiveAmount: positive.reduce((sum, row) => sum + Number(row.amount || 0), 0),
-      positiveCount: positive.length,
+      positiveAmount: visibleDailyRows.reduce((sum, row) => {
+        const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+        return sum + breakdown.positiveAmount;
+      }, 0),
+      positiveCount: financialRows.filter((row) => Number(row.positiveAmount || 0) > 0).length,
       negativeAmount: negativeRows.reduce((sum, row) => sum + Number(row.effectiveAmount || 0), 0),
       negativeCount: negativeRows.filter((row) => Number(row.effectiveAmount || 0) > 0).length,
       closedCount: closedItems.length,
@@ -529,22 +818,23 @@ export default function App() {
 
   const personTotals = useMemo(() => {
     const totalAmount = selectedRows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-    const activeAmount = selectedRows
-      .filter((row) => isPositiveStatus(row.status))
-      .reduce((sum, row) => sum + Number(row.amount || 0), 0);
-    const lockedAmount = selectedRows.reduce(
-      (sum, row) => sum + getEffectiveNegativeAmount(row, currentDayBlockByRowKey.get(row.id)),
-      0
-    );
+    const activeAmount = selectedRows.reduce((sum, row) => {
+      const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+      return sum + breakdown.positiveAmount;
+    }, 0);
+    const lockedAmount = selectedRows.reduce((sum, row) => {
+      const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+      return sum + breakdown.negativeAmount;
+    }, 0);
     return { totalAmount, activeAmount, lockedAmount, totalCount: selectedRows.length };
   }, [selectedRows, currentDayBlockByRowKey]);
 
   const filteredBlockCenter = useMemo(() => {
-    if (!filter.trim()) return latestVisibleBlockItems;
-    return latestVisibleBlockItems.filter((b) =>
+    if (!filter.trim()) return mergedBlockCenterItems;
+    return mergedBlockCenterItems.filter((b) =>
       `${b.personName} ${b.accountName} ${b.note} ${b.type} ${b.resultList} ${b.resolution}`.toLowerCase().includes(filter.toLowerCase())
     );
-  }, [latestVisibleBlockItems, filter]);
+  }, [mergedBlockCenterItems, filter]);
 
   const blockTableRows = useMemo(
     () => filteredBlockCenter.filter((item) => getBlockLifecycleState(item) === 'unresolved'),
@@ -552,10 +842,10 @@ export default function App() {
   );
 
   const blockSummary = useMemo(() => {
-    const unresolvedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'unresolved');
-    const resolvedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'resolved');
-    const closedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'closed');
-    const activatedItems = latestVisibleBlockItems.filter((item) => getBlockLifecycleState(item) === 'activated');
+    const unresolvedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'unresolved');
+    const resolvedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'resolved');
+    const closedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'closed');
+    const activatedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'activated');
     return {
       resolvedCount: resolvedItems.length,
       resolvedAmount: resolvedItems.reduce((sum, item) => sum + getResolvedReleaseAmount(item), 0),
@@ -564,15 +854,33 @@ export default function App() {
       closedCount: closedItems.length,
       activatedCount: activatedItems.length,
     };
-  }, [latestVisibleBlockItems]);
+  }, [mergedBlockCenterItems]);
 
   const generalSummaryDetails = useMemo(() => ({
-    positive: visibleDailyRows.filter((row) => isPositiveStatus(row.status)),
+    positive: visibleDailyRows.flatMap((row) => {
+      const blockItem = currentDayBlockByRowKey.get(row.id);
+      const breakdown = getRowFinancialBreakdown(row, blockItem);
+
+      if (isPositiveStatus(row.status)) {
+        return [{ ...row, amount: breakdown.positiveAmount }];
+      }
+
+      if (!breakdown.positiveAmount) return [];
+
+      return [{
+        ...row,
+        amount: breakdown.positiveAmount,
+        status: 'aktif',
+        note: `${blockItem?.note || row.note || 'Not yok'} - Blokeden cikan tutar`,
+        editedBy: getBlockChangedBy(blockItem, historyRowByKey) || row.editedBy,
+        editedAt: getBlockChangedAt(blockItem, historyRowByKey) || row.editedAt,
+      }];
+    }),
     negative: visibleDailyRows
       .filter((row) => isNegativeStatus(row.status))
       .map((row) => {
         const blockItem = currentDayBlockByRowKey.get(row.id);
-        const effectiveAmount = getEffectiveNegativeAmount(row, blockItem);
+        const effectiveAmount = getRowFinancialBreakdown(row, blockItem).negativeAmount;
         if (!effectiveAmount) return null;
         if (!blockItem || effectiveAmount === Number(row.amount || 0)) {
           return { ...row, amount: effectiveAmount };
@@ -580,26 +888,125 @@ export default function App() {
         return {
           ...row,
           amount: effectiveAmount,
-          note: `${row.note || 'Not yok'} - Kalan bloke: ${formatMoney(effectiveAmount)}`,
+          note: `${blockItem?.note || row.note || 'Not yok'} - Kalan bloke: ${formatMoney(effectiveAmount)}`,
         };
       })
       .filter(Boolean),
     activated: currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'activated'),
     closed: currentDayBlockItems.filter((item) => getBlockLifecycleState(item) === 'closed'),
-  }), [visibleDailyRows, currentDayBlockItems, currentDayBlockByRowKey]);
+    setci: currentDaySetciPayments,
+  }), [visibleDailyRows, currentDayBlockItems, currentDayBlockByRowKey, historyRowByKey, currentDaySetciPayments]);
+
+  const personById = useMemo(() => new Map(people.map((person) => [person.id, person])), [people]);
+  const allSetPaymentRows = useMemo(
+    () =>
+      visibleSetPayments.map((item) => {
+        const personId = getSetPaymentPersonId(item.sourceRowKey);
+        const person = personById.get(personId);
+        return {
+          ...item,
+          personId,
+          monthKey: getSetPaymentMonthKey(item.sourceRowKey),
+          monthLabel: getSetPaymentMonthLabel(getSetPaymentMonthKey(item.sourceRowKey)),
+          setPaymentStatusLabel: getSetPaymentStatusLabel(item.resolution),
+          setStartDate: person?.startDate || '',
+          bankCount: person?.accountNames?.length || 0,
+          bankList: (person?.accounts || [])
+            .map((account) => `${account.bankName} (${formatDisplayDateTime(account.createdAt)})`)
+            .join(' | '),
+        };
+      }),
+    [visibleSetPayments, personById]
+  );
+
+  const selectedPersonAccountMeta = useMemo(
+    () => new Map((selectedPerson?.accounts || []).map((account) => [account.bankName, account])),
+    [selectedPerson]
+  );
+
+  const selectedPersonReportRows = useMemo(() => {
+    if (!selectedPersonId) return [];
+    const latestBlockByRowKey = buildLatestBlockMap(visibleBlockCenter);
+
+    return Object.keys(historyByDay)
+      .sort((left, right) => right.localeCompare(left))
+      .flatMap((day) =>
+        (historyByDay[day] || [])
+          .filter((row) => row.personId === selectedPersonId)
+          .map((row) => {
+            const blockItem = latestBlockByRowKey.get(row.id);
+            const normalizedStatus = normalizeStatus(row.status, 'pasif');
+            const breakdown = getRowFinancialBreakdown(row, blockItem);
+
+            return {
+              ...row,
+              day,
+              status: normalizedStatus,
+              amount: breakdown.baseAmount,
+              positiveAmount: breakdown.positiveAmount,
+              negativeAmount: breakdown.negativeAmount,
+              statusLabel: getStatusLabel(normalizedStatus),
+              blockResultLabel: blockItem ? getBlockResultMeta(blockItem).label : '-',
+              blockResultList: blockItem?.resultList || '-',
+              blockResolution: blockItem?.resolution || '-',
+              blockNote: blockItem?.note || '',
+              blockCreatedAt: blockItem?.createdAt || '',
+              blockChangedAt: getBlockChangedAt(blockItem, historyRowByKey),
+              blockChangedBy: getBlockChangedBy(blockItem, historyRowByKey),
+              accountCreatedAt: selectedPersonAccountMeta.get(row.accountName)?.createdAt || '',
+              setStartDate: selectedPerson?.startDate || '',
+            };
+          })
+      );
+  }, [historyByDay, selectedPersonId, visibleBlockCenter, selectedPersonAccountMeta, historyRowByKey, selectedPerson?.startDate]);
+
+  const selectedPersonSetciPayments = useMemo(() => {
+    if (!selectedPerson) return [];
+    return visibleSetciPayments
+      .filter((item) => item.personName === selectedPerson.fullName)
+      .sort((left, right) => String(right.createdAt || right.date || '').localeCompare(String(left.createdAt || left.date || '')));
+  }, [selectedPerson, visibleSetciPayments]);
+
+  const selectedPersonSetPaymentRows = useMemo(() => {
+    if (!selectedPerson) return [];
+    return allSetPaymentRows
+      .filter((item) => item.personId === selectedPerson.id)
+      .sort((left, right) => String(right.createdAt || right.date || '').localeCompare(String(left.createdAt || left.date || '')));
+  }, [selectedPerson, allSetPaymentRows]);
+
+  const setciPaymentSummary = useMemo(() => ({
+    count: currentDaySetciPayments.length,
+    amount: currentDaySetciPayments.reduce((sum, item) => sum + Number(item.amount || 0), 0),
+  }), [currentDaySetciPayments]);
+
+  const onlineUsersSummary = useMemo(() => {
+    if (!onlineUsers.length) {
+      return {
+        title: 'Aktif kullanıcı yok',
+        detail: 'Şu anda panelde canlı işlem yapan bir kullanıcı görünmüyor.',
+      };
+    }
+
+    const names = onlineUsers.map((user) => `${user.displayName}${user.pageLabel ? ` (${user.pageLabel})` : ''}`);
+    return {
+      title: `${onlineUsers.length} aktif kullanıcı`,
+      detail: names.join(', '),
+    };
+  }, [onlineUsers]);
 
   const chartDailyTrend = useMemo(() => {
     const keys = Object.keys(historyByDay).sort();
     const latestBlockByRowKey = buildLatestBlockMap(visibleBlockCenter);
     return keys.slice(-7).map((day) => {
       const rows = historyByDay[day] || [];
-      const active = rows
-        .filter((row) => isPositiveStatus(row.status))
-        .reduce((sum, row) => sum + Number(row.amount || 0), 0);
-      const blocked = rows.reduce(
-        (sum, row) => sum + getEffectiveNegativeAmount(row, latestBlockByRowKey.get(row.id)),
-        0
-      );
+      const active = rows.reduce((sum, row) => {
+        const breakdown = getRowFinancialBreakdown(row, latestBlockByRowKey.get(row.id));
+        return sum + breakdown.positiveAmount;
+      }, 0);
+      const blocked = rows.reduce((sum, row) => {
+        const breakdown = getRowFinancialBreakdown(row, latestBlockByRowKey.get(row.id));
+        return sum + breakdown.negativeAmount;
+      }, 0);
       return { day: day.slice(5), aktif: active, bloke: blocked };
     });
   }, [historyByDay, visibleBlockCenter]);
@@ -637,8 +1044,8 @@ function getPersonIdFromRowKey(rowKey = '') {
 
 function normalizeUserRecord(row) {
   if (!row) return null;
-  const username = row.username || '';
-  const displayName = row.display_name || row.displayName || username.toUpperCase();
+  const username = normalizeUsername(row.username || '');
+  const displayName = normalizeDisplayName(row.display_name || row.displayName || username);
   const isDeleted = Boolean(row.is_deleted ?? row.isDeleted ?? false) || username.startsWith('__deleted__') || displayName.includes('(SİLİNDİ)');
   return {
     ...row,
@@ -661,15 +1068,26 @@ function buildPeopleFromDb(peopleRows = [], accountRows = []) {
   });
   return [...peopleRows]
     .sort((a, b) => String(a.full_name || '').localeCompare(String(b.full_name || '')))
-    .map((row) => ({
-      id: row.id,
-      fullName: row.full_name,
-      startDate: row.start_date || TODAY,
-      createdByUserId: row.created_by || '',
-      accountNames: (grouped[row.id] || [])
+    .map((row) => {
+      const accounts = (grouped[row.id] || [])
         .sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0))
-        .map((acc) => acc.bank_name),
-    }));
+        .map((acc) => ({
+          id: acc.id,
+          bankName: acc.bank_name,
+          sortOrder: Number(acc.sort_order || 0),
+          createdAt: acc.created_at || '',
+        }));
+
+      return {
+        id: row.id,
+        fullName: row.full_name,
+        startDate: row.start_date || TODAY,
+        createdByUserId: row.created_by || '',
+        createdAt: row.created_at || '',
+        accounts,
+        accountNames: accounts.map((acc) => acc.bankName),
+      };
+    });
 }
 
 function buildZeroRowsForPeople(peopleList = [], day = TODAY) {
@@ -710,6 +1128,8 @@ function buildHistoryFromDb(transactionRows = [], peopleList = []) {
 }
 
 function normalizeBlockRecord(row) {
+  const resultList = row.result_list || 'merkez';
+  const normalizedType = resultList === SET_PAYMENT_RESULT ? normalizeStatus(row.type, 'pasif') : normalizeBlockedStatus(row.type);
   return {
     id: row.id,
     sourceRowKey: row.source_row_key || '',
@@ -717,28 +1137,51 @@ function normalizeBlockRecord(row) {
     personName: row.person_name || '',
     accountName: row.account_name || '',
     amount: Number(row.amount || 0),
-    type: normalizeBlockedStatus(row.type),
+    type: normalizedType,
     note: row.note || '',
     resolution: row.resolution || 'cozulmedi',
-    resultList: row.result_list || 'merkez',
+    resultList,
     resolvedAmount: Number(row.resolved_amount || 0),
     createdBy: row.created_by || '',
     createdAt: row.created_at || '',
   };
 }
 
-async function loadUsersFromDb() {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('is_active', true)
-    .order('created_at', { ascending: true });
-  if (error) throw error;
-  const normalized = (data || [])
-    .map(normalizeUserRecord)
-    .filter((user) => user.isActive && !user.isDeleted);
-  setUsers(normalized);
-  return normalized;
+async function repairLegacyStatusRows(transactionRows = [], blockRows = []) {
+  const txFixes = transactionRows.filter((row) => shouldRepairTransactionStatus(row.status));
+  const blockFixes = blockRows.filter((row) => {
+    if ((row.result_list || '') === SET_PAYMENT_RESULT) {
+      return shouldRepairTransactionStatus(row.type);
+    }
+    return shouldRepairBlockStatus(row.type);
+  });
+
+  if (!txFixes.length && !blockFixes.length) return;
+
+  await Promise.all([
+    ...txFixes.map((row) =>
+      supabase
+        .from('transactions')
+        .update({ status: normalizeStatus(row.status, 'pasif') })
+        .eq('row_key', row.row_key)
+        .then(({ error }) => {
+          if (error) throw error;
+        })
+    ),
+    ...blockFixes.map((row) =>
+      supabase
+        .from('blocks')
+        .update({
+          type: (row.result_list || '') === SET_PAYMENT_RESULT
+            ? normalizeStatus(row.type, 'pasif')
+            : normalizeBlockedStatus(row.type),
+        })
+        .eq('id', row.id)
+        .then(({ error }) => {
+          if (error) throw error;
+        })
+    ),
+  ]);
 }
 
 async function loadBanksFromDb() {
@@ -767,6 +1210,10 @@ async function loadSupabaseAppData() {
     if (txRes.error) throw txRes.error;
     if (blocksRes.error) throw blocksRes.error;
 
+    try {
+      await repairLegacyStatusRows(txRes.data || [], blocksRes.data || []);
+    } catch {}
+
     const nextUsers = (usersRes.data || [])
       .map(normalizeUserRecord)
       .filter((user) => user.isActive && !user.isDeleted);
@@ -779,8 +1226,12 @@ async function loadSupabaseAppData() {
     setBankList(nextBanks.length ? nextBanks : DEFAULT_BANKS);
     setPeople(nextPeople);
     setHistoryByDay(nextHistory);
-    setSelectedDay((prev) => (prev && nextHistory[prev] ? prev : getLatestHistoryDay(nextHistory)));
+    setSelectedDay((prev) => {
+      const preferredDay = prev || getStoredReportDay();
+      return preferredDay && nextHistory[preferredDay] ? preferredDay : getLatestHistoryDay(nextHistory);
+    });
     setBlockCenter(nextBlocks);
+    setDataReady(true);
     return { users: nextUsers, banks: nextBanks, people: nextPeople, history: nextHistory, blocks: nextBlocks };
   } finally {
     setAppLoading(false);
@@ -789,89 +1240,323 @@ async function loadSupabaseAppData() {
 
   function handleExportPDF() {
     const doc = new jsPDF();
-    doc.setFontSize(18);
-    doc.text('SET YONETIM PANELI RAPORU', 14, 20);
-    doc.setFontSize(11);
-    doc.text(`Rapor Gunu: ${selectedDay}`, 14, 32);
-    doc.text(`Aktif + NFC Bakiye: ${formatMoney(groupedTotals.positiveAmount)}`, 14, 42);
-    doc.text(`Bloke + Sifre Kilit: ${formatMoney(groupedTotals.negativeAmount)}`, 14, 52);
-    doc.text(`Aktife Alinan Hesaplar: ${groupedTotals.activatedCount}`, 14, 62);
-    doc.text(`Kapanan Hesaplar: ${groupedTotals.closedCount}`, 14, 72);
-    doc.text('Durum: Aktif veri girişi yok', 14, 84);
+    const generatedAt = getTurkeyNow().dateTime;
+    let y = renderPdfHeader(doc, 'SET YONETIM PANELI RAPORU', [
+      `Rapor Gunu: ${selectedDay}`,
+      `Olusturma: ${generatedAt}`,
+      `Aktif + NFC Bakiye: ${formatMoney(groupedTotals.positiveAmount)}`,
+      `Bloke + Sifre Kilit: ${formatMoney(groupedTotals.negativeAmount)}`,
+      `Aktife Alinan Hesaplar: ${groupedTotals.activatedCount}`,
+      `Kapanan Hesaplar: ${groupedTotals.closedCount}`,
+      `Setci Odemesi: ${formatMoney(setciPaymentSummary.amount)} / ${setciPaymentSummary.count} kayit`,
+      `Canli Kullanicilar: ${onlineUsersSummary.detail}`,
+    ]);
 
-    let y = 100;
-    selectedRows.forEach((row, idx) => {
-      const line = `${idx + 1}. ${row.accountName} | ${formatMoney(row.amount)} | ${STATUS_META[row.status]?.label || row.status} | ${row.editedBy || '-'}`;
-      doc.text(line, 14, y);
-      y += 8;
-      if (y > 280) {
-        doc.addPage();
-        y = 20;
-      }
-    });
+    y = renderPdfSection(
+      doc,
+      'SET DURUMU',
+      visibleDailyRows.map((row, idx) => {
+        const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+        const person = personById.get(row.personId);
+        const accountMeta = (person?.accounts || []).find((account) => account.bankName === row.accountName);
+        return `${idx + 1}. ${row.personName} | ${row.accountName} | Set Alinma: ${person?.startDate || '-'} | Banka Eklenme: ${formatDisplayDateTime(accountMeta?.createdAt || '')} | Kayit: ${formatMoney(row.amount)} | Aktif+NFC: ${formatMoney(breakdown.positiveAmount)} | Bloke: ${formatMoney(breakdown.negativeAmount)} | Durum: ${getStatusLabel(row.status)} | Not: ${row.note || 'Not yok'} | Islem: ${row.editedBy || '-'} | Tarih: ${row.editedAt || '-'}`;
+      }),
+      y
+    );
+
+    if (allSetPaymentRows.length) {
+      y = renderPdfSection(
+        doc,
+        'SET ODEMELERI',
+        allSetPaymentRows.map((item, index) => `${index + 1}. ${item.personName} | ${item.monthLabel} | ${item.setPaymentStatusLabel} | Tutar: ${formatMoney(item.amount)} | Set Alinma: ${item.setStartDate || '-'} | Banka Sayisi: ${item.bankCount} | Bankalar: ${item.bankList || '-'} | Not: ${item.note || 'Not yok'} | Islem: ${item.createdBy || '-'} | Tarih: ${formatDisplayDateTime(item.createdAt || item.date)}`),
+        y
+      );
+    }
+
+    if (currentDaySetciPayments.length) {
+      y = renderPdfSection(
+        doc,
+        'SETCI ODEMESI KAYITLARI',
+        currentDaySetciPayments.map((item, index) => `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(item.amount)} | ${item.createdBy || '-'} | ${formatDisplayDateTime(item.createdAt || item.date)} | ${item.note || 'Not yok'}`),
+        y
+      );
+    }
 
     doc.save(`set-yonetim-paneli-${selectedDay}.pdf`);
   }
 
   function handleExportExcel() {
-    const rows = visibleDailyRows.map((row) => ({
-      Sahis: row.personName,
-      Hesap: row.accountName,
-      Tutar: Number(row.amount || 0),
-      Durum: STATUS_META[row.status]?.label || row.status,
-      Not: row.note || '',
-      Duzenleyen: row.editedBy || '',
-      Tarih: row.editedAt || '',
-    }));
-
-    const worksheet = XLSX.utils.json_to_sheet(rows);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Set Durumu');
+    const generatedAt = getTurkeyNow().dateTime;
+
+    appendStructuredSheet(workbook, {
+      sheetName: 'Set Durumu',
+      title: 'Set Yönetim Paneli Raporu',
+      summaryRows: [
+        `Rapor Gunu: ${selectedDay}`,
+        `Olusturma: ${generatedAt}`,
+        `Aktif + NFC Bakiye: ${formatMoney(groupedTotals.positiveAmount)}`,
+        `Bloke + Sifre Kilit: ${formatMoney(groupedTotals.negativeAmount)}`,
+      ],
+      columns: [
+        { key: 'personName', label: 'Şahıs', width: 22 },
+        { key: 'accountName', label: 'Hesap', width: 22 },
+        { key: 'setStartDate', label: 'Set Alınma Tarihi', width: 16 },
+        { key: 'accountCreatedAt', label: 'Banka Eklenme Tarihi', width: 20 },
+        { key: 'amount', label: 'Kayıt Tutarı', width: 14, type: 'currency' },
+        { key: 'positiveAmount', label: 'Aktif + NFC', width: 14, type: 'currency' },
+        { key: 'negativeAmount', label: 'Bloke + Şifre Kilit', width: 18, type: 'currency' },
+        { key: 'statusLabel', label: 'Durum', width: 16 },
+        { key: 'note', label: 'Not', width: 28 },
+        { key: 'editedBy', label: 'İşlemi Yapan', width: 20 },
+        { key: 'editedAt', label: 'Son Değişiklik', width: 20 },
+      ],
+      rows: visibleDailyRows.map((row) => {
+        const breakdown = getRowFinancialBreakdown(row, currentDayBlockByRowKey.get(row.id));
+        const person = personById.get(row.personId);
+        const accountMeta = (person?.accounts || []).find((account) => account.bankName === row.accountName);
+        return {
+          ...row,
+          setStartDate: person?.startDate || '',
+          accountCreatedAt: formatDisplayDateTime(accountMeta?.createdAt || ''),
+          positiveAmount: Number(breakdown.positiveAmount || 0),
+          negativeAmount: Number(breakdown.negativeAmount || 0),
+          statusLabel: getStatusLabel(row.status),
+        };
+      }),
+    });
+
+    if (allSetPaymentRows.length) {
+      appendStructuredSheet(workbook, {
+        sheetName: 'Set Odemeleri',
+        title: 'Set Ödemeleri',
+        summaryRows: [
+          `Rapor Gunu: ${selectedDay}`,
+          `Olusturma: ${generatedAt}`,
+        ],
+        columns: [
+          { key: 'personName', label: 'Şahıs', width: 22 },
+          { key: 'monthLabel', label: 'Dönem', width: 12 },
+          { key: 'setPaymentStatusLabel', label: 'Durum', width: 14 },
+          { key: 'amount', label: 'Tutar', width: 14, type: 'currency' },
+          { key: 'setStartDate', label: 'Set Alınma Tarihi', width: 16 },
+          { key: 'bankCount', label: 'Banka Sayısı', width: 12, type: 'number' },
+          { key: 'bankList', label: 'Sete Eklenen Bankalar', width: 42 },
+          { key: 'note', label: 'Not', width: 28 },
+          { key: 'createdBy', label: 'İşlemi Yapan', width: 18 },
+          { key: 'createdAt', label: 'Değişiklik Tarihi', width: 20, value: (row) => formatDisplayDateTime(row.createdAt || row.date) },
+        ],
+        rows: allSetPaymentRows,
+      });
+    }
+
+    if (currentDaySetciPayments.length) {
+      appendStructuredSheet(workbook, {
+        sheetName: 'Setci Odemesi',
+        title: 'Setçi Ödemesi Kayıtları',
+        summaryRows: [
+          `Rapor Gunu: ${selectedDay}`,
+          `Olusturma: ${generatedAt}`,
+        ],
+        columns: [
+          { key: 'date', label: 'Rapor Gunu', width: 14 },
+          { key: 'personName', label: 'Şahıs', width: 22 },
+          { key: 'accountName', label: 'Hesap', width: 22 },
+          { key: 'amount', label: 'Alınan Tutar', width: 14, type: 'currency' },
+          { key: 'createdBy', label: 'İşlemi Yapan', width: 18 },
+          { key: 'createdAt', label: 'Değişiklik Tarihi', width: 20, value: (row) => formatDisplayDateTime(row.createdAt || row.date) },
+          { key: 'note', label: 'Not', width: 28 },
+        ],
+        rows: currentDaySetciPayments,
+      });
+    }
+
     XLSX.writeFile(workbook, `set-yonetim-paneli-${selectedDay}.xlsx`);
+  }
+
+  function handlePersonExportPDF() {
+    if (!selectedPerson) {
+      showActionNotice('Bilgi', 'Önce rapor almak istediğiniz kişiyi seçin.');
+      return;
+    }
+
+    const doc = new jsPDF();
+    let y = renderPdfHeader(doc, `${selectedPerson.fullName} SET RAPORU`, [
+      `Rapor Gunu: ${selectedDay}`,
+      `Set Alinma Tarihi: ${selectedPerson.startDate || '-'}`,
+      `Toplam Hesap: ${selectedPerson.accountNames.length}`,
+      `Kayit Sayisi: ${selectedPersonReportRows.length}`,
+    ]);
+
+    y = renderPdfSection(
+      doc,
+      'KISI BAZLI HAREKETLER',
+      selectedPersonReportRows.map((row, idx) => `${idx + 1}. ${row.day} | ${row.accountName} | Set Alinma: ${row.setStartDate || '-'} | Banka Eklenme: ${formatDisplayDateTime(row.accountCreatedAt)} | Kayit: ${formatMoney(row.amount)} | Aktif+NFC: ${formatMoney(row.positiveAmount)} | Bloke: ${formatMoney(row.negativeAmount)} | ${row.statusLabel} | ${row.note || 'Not yok'} | ${row.editedBy || '-'} | ${row.editedAt || '-'} | Bloke Sonucu: ${row.blockResultLabel}`),
+      y
+    );
+
+    if (selectedPersonSetPaymentRows.length) {
+      y = renderPdfSection(
+        doc,
+        'SET ODEMELERI',
+        selectedPersonSetPaymentRows.map((item, idx) => `${idx + 1}. ${item.monthLabel} | ${item.setPaymentStatusLabel} | ${formatMoney(item.amount)} | Set Alinma: ${item.setStartDate || '-'} | Banka Sayisi: ${item.bankCount} | Bankalar: ${item.bankList || '-'} | Not: ${item.note || 'Not yok'} | ${item.createdBy || '-'} | ${formatDisplayDateTime(item.createdAt || item.date)}`),
+        y
+      );
+    }
+
+    if (selectedPersonSetciPayments.length) {
+      y = renderPdfSection(
+        doc,
+        'SETCI ODEMESI KAYITLARI',
+        selectedPersonSetciPayments.map((item, idx) => `${idx + 1}. ${item.date} | ${item.accountName} | ${formatMoney(item.amount)} | ${item.createdBy || '-'} | ${formatDisplayDateTime(item.createdAt || item.date)} | ${item.note || 'Not yok'}`),
+        y
+      );
+    }
+
+    doc.save(`set-raporu-${selectedPerson.fullName}-${selectedDay}.pdf`);
+  }
+
+  function handlePersonExportExcel() {
+    if (!selectedPerson) {
+      showActionNotice('Bilgi', 'Önce rapor almak istediğiniz kişiyi seçin.');
+      return;
+    }
+
+    const workbook = XLSX.utils.book_new();
+    const generatedAt = getTurkeyNow().dateTime;
+
+    appendStructuredSheet(workbook, {
+      sheetName: 'Kisi Raporu',
+      title: `${selectedPerson.fullName} Kişi Bazlı Rapor`,
+      summaryRows: [
+        `Rapor Gunu: ${selectedDay}`,
+        `Set Alinma Tarihi: ${selectedPerson.startDate || '-'}`,
+        `Olusturma: ${generatedAt}`,
+      ],
+      columns: [
+        { key: 'day', label: 'Gun', width: 14 },
+        { key: 'personName', label: 'Şahıs', width: 22 },
+        { key: 'accountName', label: 'Hesap', width: 22 },
+        { key: 'setStartDate', label: 'Set Alınma Tarihi', width: 16 },
+        { key: 'accountCreatedAt', label: 'Banka Eklenme Tarihi', width: 20, value: (row) => formatDisplayDateTime(row.accountCreatedAt) },
+        { key: 'amount', label: 'Kayıt Tutarı', width: 14, type: 'currency' },
+        { key: 'positiveAmount', label: 'Aktif + NFC', width: 14, type: 'currency' },
+        { key: 'negativeAmount', label: 'Bloke + Şifre Kilit', width: 18, type: 'currency' },
+        { key: 'statusLabel', label: 'Durum', width: 16 },
+        { key: 'note', label: 'Not', width: 28 },
+        { key: 'editedBy', label: 'Düzenleyen', width: 18 },
+        { key: 'editedAt', label: 'Düzenleme Tarihi', width: 20 },
+        { key: 'blockResultLabel', label: 'Bloke Sonucu', width: 16 },
+        { key: 'blockNote', label: 'Bloke Notu', width: 28 },
+        { key: 'blockCreatedAt', label: 'Bloke Kayıt Tarihi', width: 20, value: (row) => formatDisplayDateTime(row.blockCreatedAt) },
+        { key: 'blockChangedAt', label: 'Bloke Değişiklik Tarihi', width: 22, value: (row) => formatDisplayDateTime(row.blockChangedAt) },
+        { key: 'blockChangedBy', label: 'Bloke İşlemi Yapan', width: 18 },
+      ],
+      rows: selectedPersonReportRows,
+    });
+
+    if (selectedPersonSetPaymentRows.length) {
+      appendStructuredSheet(workbook, {
+        sheetName: 'Set Odemeleri',
+        title: `${selectedPerson.fullName} Set Ödemeleri`,
+        summaryRows: [
+          `Rapor Gunu: ${selectedDay}`,
+          `Olusturma: ${generatedAt}`,
+        ],
+        columns: [
+          { key: 'monthLabel', label: 'Dönem', width: 12 },
+          { key: 'setPaymentStatusLabel', label: 'Durum', width: 14 },
+          { key: 'amount', label: 'Tutar', width: 14, type: 'currency' },
+          { key: 'setStartDate', label: 'Set Alınma Tarihi', width: 16 },
+          { key: 'bankCount', label: 'Banka Sayısı', width: 12, type: 'number' },
+          { key: 'bankList', label: 'Sete Eklenen Bankalar', width: 42 },
+          { key: 'note', label: 'Not', width: 28 },
+          { key: 'createdBy', label: 'İşlemi Yapan', width: 18 },
+          { key: 'createdAt', label: 'Değişiklik Tarihi', width: 20, value: (row) => formatDisplayDateTime(row.createdAt || row.date) },
+        ],
+        rows: selectedPersonSetPaymentRows,
+      });
+    }
+
+    if (selectedPersonSetciPayments.length) {
+      appendStructuredSheet(workbook, {
+        sheetName: 'Setci Odemesi',
+        title: `${selectedPerson.fullName} Setçi Ödemesi`,
+        summaryRows: [
+          `Rapor Gunu: ${selectedDay}`,
+          `Olusturma: ${generatedAt}`,
+        ],
+        columns: [
+          { key: 'date', label: 'Gun', width: 14 },
+          { key: 'personName', label: 'Şahıs', width: 22 },
+          { key: 'accountName', label: 'Hesap', width: 22 },
+          { key: 'amount', label: 'Alınan Tutar', width: 14, type: 'currency' },
+          { key: 'createdBy', label: 'İşlemi Yapan', width: 18 },
+          { key: 'createdAt', label: 'Tarih', width: 20, value: (row) => formatDisplayDateTime(row.createdAt || row.date) },
+          { key: 'note', label: 'Not', width: 28 },
+        ],
+        rows: selectedPersonSetciPayments,
+      });
+    }
+    XLSX.writeFile(workbook, `set-raporu-${selectedPerson.fullName}-${selectedDay}.xlsx`);
   }
 
   function handleBlockExportPDF() {
     const doc = new jsPDF();
-    doc.setFontSize(18);
-    doc.text('BLOKE MERKEZI RAPORU', 14, 20);
+    let y = renderPdfHeader(doc, 'BLOKE MERKEZI RAPORU', [
+      `Rapor Gunu: ${selectedDay}`,
+      `Olusturma: ${getTurkeyNow().dateTime}`,
+      `Acik Bloke Sayisi: ${blockSummary.unresolvedCount}`,
+      `Acik Bloke Tutari: ${formatMoney(blockSummary.unresolvedAmount)}`,
+    ]);
 
     if (blockTableRows.length === 0) {
-      doc.setFontSize(11);
-      doc.text('Kayit yok.', 14, 32);
+      renderPdfSection(doc, '', ['Kayit yok.'], y);
       doc.save(`bloke-merkezi-${selectedDay}.pdf`);
       return;
     }
 
-    doc.setFontSize(11);
-    let y = 34;
-    blockTableRows.forEach((item, index) => {
-      const line = `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(getCurrentBlockedAmount(item))} | ${STATUS_META[item.type]?.label || item.type} | ${item.resolution}`;
-      doc.text(line, 14, y);
-      y += 8;
-      if (y > 280) {
-        doc.addPage();
-        y = 20;
-      }
-    });
+    renderPdfSection(
+      doc,
+      'ACIK BLOKE KAYITLARI',
+      blockTableRows.map((item, index) => `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(getCurrentBlockedAmount(item))} | ${STATUS_META[item.type]?.label || item.type} | Bloke Olma: ${getBlockCreatedDisplayValue(item)} | Not: ${item.note || 'Not yok'} | Cozum: ${item.resolution} | Sonuc: ${item.resultList} | Olusturan: ${item.createdBy || '-'} | Son Degisiklik: ${formatDisplayDateTime(getBlockChangedAt(item, historyRowByKey))} | Son Islem: ${getBlockChangedBy(item, historyRowByKey) || '-'}`),
+      y
+    );
     doc.save(`bloke-merkezi-${selectedDay}.pdf`);
   }
 
   function handleBlockExportExcel() {
-    const rows = blockTableRows.map((item) => ({
-      Tarih: item.date,
-      Sahis: item.personName,
-      Hesap: item.accountName,
-      Tutar: Number(getCurrentBlockedAmount(item) || 0),
-      Durum: STATUS_META[item.type]?.label || item.type,
-      Not: item.note || '',
-      Cozum: item.resolution,
-      Sonuc: item.resultList,
-      Olusturan: item.createdBy || '',
-    }));
-
-    const worksheet = XLSX.utils.json_to_sheet(rows);
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Bloke Merkezi');
+    appendStructuredSheet(workbook, {
+      sheetName: 'Bloke Merkezi',
+      title: 'Bloke Merkezi Raporu',
+      summaryRows: [
+        `Rapor Gunu: ${selectedDay}`,
+        `Olusturma: ${getTurkeyNow().dateTime}`,
+      ],
+      columns: [
+        { key: 'date', label: 'Rapor Günü', width: 14 },
+        { key: 'blockCreatedAt', label: 'Bloke Olma Tarihi', width: 20 },
+        { key: 'personName', label: 'Şahıs', width: 22 },
+        { key: 'accountName', label: 'Hesap', width: 22 },
+        { key: 'amount', label: 'Tutar', width: 14, type: 'currency' },
+        { key: 'typeLabel', label: 'Durum', width: 16 },
+        { key: 'note', label: 'Not', width: 28 },
+        { key: 'resolution', label: 'Çözüm', width: 14 },
+        { key: 'resultList', label: 'Sonuc', width: 16 },
+        { key: 'createdBy', label: 'Oluşturan Kullanıcı', width: 18 },
+        { key: 'changedAt', label: 'Son Değişiklik Tarihi', width: 22 },
+        { key: 'changedBy', label: 'İşlemi Yapan Kullanıcı', width: 18 },
+      ],
+      rows: blockTableRows.map((item) => ({
+        ...item,
+        blockCreatedAt: getBlockCreatedDisplayValue(item),
+        amount: Number(getCurrentBlockedAmount(item) || 0),
+        typeLabel: STATUS_META[item.type]?.label || item.type,
+        changedAt: formatDisplayDateTime(getBlockChangedAt(item, historyRowByKey)),
+        changedBy: getBlockChangedBy(item, historyRowByKey),
+      })),
+    });
     XLSX.writeFile(workbook, `bloke-merkezi-${selectedDay}.xlsx`);
   }
 
@@ -884,11 +1569,12 @@ async function loadSupabaseAppData() {
   }
 
   function ensureDay(day) {
-    if (historyByDay[day]) return;
-    setHistoryByDay((prev) => ({
-      ...prev,
-      [day]: buildZeroRowsForPeople(people, day),
-    }));
+    if (historyByDay[day]) {
+      setSelectedDay(day);
+      return true;
+    }
+    showActionNotice('Bilgi', 'Yeni bir rapor gunu acmak icin Yeni Gune Basla butonunu kullanin.');
+    return false;
   }
 
 async function startNewDay() {
@@ -908,8 +1594,8 @@ async function startNewDay() {
       amount: normalizedStatus === 'aktif' ? 0 : Number(row.amount || 0),
       status: normalizedStatus,
       note: row.note || '',
-      editedBy: '',
-      editedAt: '',
+      editedBy: row.editedBy || '',
+      editedAt: row.editedAt || '',
     };
   });
 
@@ -924,8 +1610,8 @@ async function startNewDay() {
       amount: Number(row.amount || 0),
       status: row.status,
       note: row.note || '',
-      edited_by: '',
-      edited_at: '',
+      edited_by: row.editedBy || '',
+      edited_at: row.editedAt || '',
     }));
     if (payload.length) {
       const { error } = await supabase.from('transactions').upsert(payload, { onConflict: 'row_key' });
@@ -946,7 +1632,7 @@ async function startNewDay() {
   async function handleLogin() {
     setAppLoading(true);
     try {
-      const username = String(login.username || '').trim().toLowerCase();
+      const username = normalizeUsername(login.username);
       const password = String(login.password || '').trim();
       if (!username || !password) {
         showActionNotice('Hata', 'Kullanıcı adı ve şifre zorunludur.', 'danger');
@@ -956,20 +1642,23 @@ async function startNewDay() {
         .from('users')
         .select('*')
         .eq('username', username)
-        .maybeSingle();
+        .eq('is_active', true)
+        .order('created_at', { ascending: false })
+        .limit(1);
 
-      if (error || !data) {
+      const matchedUser = data?.[0] || null;
+      if (error || !matchedUser) {
         showActionNotice('Hata', 'Giriş bilgileri hatalı.', 'danger');
         return;
       }
 
-      const savedPassword = String(data.password || '').trim();
+      const savedPassword = String(matchedUser.password || '').trim();
       if (savedPassword !== password) {
         showActionNotice('Hata', 'Giriş bilgileri hatalı.', 'danger');
         return;
       }
 
-      const normalizedUser = normalizeUserRecord(data);
+      const normalizedUser = normalizeUserRecord(matchedUser);
       if (normalizedUser.isDeleted) {
         showActionNotice('Hata', 'Bu kullanıcı silinmiş durumda.', 'danger');
         return;
@@ -980,10 +1669,7 @@ async function startNewDay() {
       }
 
       setCurrentUser(normalizedUser);
-      try {
-        window.localStorage.setItem(STORAGE_CURRENT_USER, JSON.stringify(normalizedUser));
-        window.history.replaceState({}, '', window.location.pathname);
-      } catch {}
+      setLogin({ username: '', password: '' });
       await loadSupabaseAppData();
     } catch (err) {
       showActionNotice('Hata', err?.message || 'Giriş sırasında hata oluştu.', 'danger');
@@ -1003,6 +1689,12 @@ async function startNewDay() {
     const baseRow = pendingSetRows[rowId] || currentRow;
     if (!baseRow) return;
     const nextValue = key === 'status' ? normalizeStatus(value, 'pasif') : value;
+    const persistedStatus = normalizeStatus(currentRow?.status, 'pasif');
+
+    if (key === 'status' && !canManage && isManagerLockedStatus(persistedStatus) && nextValue !== persistedStatus) {
+      showActionNotice('Yetki yok', 'BLOKE ve ÅžÄ°FRE KÄ°LÄ°T durumunu sadece yÃ¶netici deÄŸiÅŸtirebilir.', 'danger');
+      return;
+    }
 
     setPendingSetRows((prev) => ({
       ...prev,
@@ -1023,33 +1715,81 @@ async function saveSetDurumu() {
     return;
   }
 
+  const lockedStatusViolation = Object.values(pendingSetRows).find((nextRow) => {
+    const currentRow = (historyByDay[selectedDay] || []).find((row) => row.id === nextRow.id);
+    const previousStatus = normalizeStatus(currentRow?.status, 'pasif');
+    const nextStatus = normalizeStatus(nextRow?.status, 'pasif');
+    return !canManage && isManagerLockedStatus(previousStatus) && nextStatus !== previousStatus;
+  });
+
+  if (lockedStatusViolation) {
+    showActionNotice('Yetki yok', 'BLOKE ve SIFRE KILIT durumunu sadece yonetici geri degistirebilir.', 'danger');
+    return;
+  }
+
+  const latestBlockByRowKey = buildLatestBlockMap(blockCenter);
   const newBlockItems = [];
+  const updatedBlockItems = [];
   const nextRows = (historyByDay[selectedDay] || []).map((row) => {
     const nextRow = pendingSetRows[row.id];
     if (!nextRow) return row;
 
     const previousStatus = normalizeStatus(row.status, 'pasif');
     const nextStatus = normalizeStatus(nextRow.status, 'pasif');
-    const wasBlockedBefore = previousStatus === 'bloke' || previousStatus === 'sifre_kilit';
     const isBlockedNow = nextStatus === 'bloke' || nextStatus === 'sifre_kilit';
     const sourceRowKey = makeRowKey(selectedDay, nextRow.personId, nextRow.accountName);
-    if (!wasBlockedBefore && isBlockedNow) {
-      const exists = blockCenter.some((b) => b.sourceRowKey === sourceRowKey && b.resultList === 'merkez');
-      if (!exists) {
-        newBlockItems.push({
-          sourceRowKey,
-          date: selectedDay,
-          personName: nextRow.personName,
-          accountName: nextRow.accountName,
-          amount: Number(nextRow.amount || 0),
-          type: normalizeBlockedStatus(nextStatus),
-          note: nextRow.note || '',
-          resolution: 'cozulmedi',
-          resultList: 'merkez',
-          resolvedAmount: 0,
-          createdBy: currentUser.displayName,
-        });
+    const latestBlockItem = latestBlockByRowKey.get(sourceRowKey) || null;
+    const latestBlockLifecycle = getBlockLifecycleState(latestBlockItem);
+    const hasOpenBlock = latestBlockLifecycle === 'unresolved';
+
+    if (isBlockedNow) {
+      const carriedResolvedAmount = Math.max(
+        0,
+        Math.min(Number(nextRow.amount || 0), Number(latestBlockItem?.resolvedAmount || 0))
+      );
+      const syncedBlockItem = {
+        id: latestBlockItem?.id,
+        sourceRowKey,
+        date: selectedDay,
+        personName: nextRow.personName,
+        accountName: nextRow.accountName,
+        amount: Number(nextRow.amount || 0),
+        type: normalizeBlockedStatus(nextStatus),
+        note: nextRow.note || latestBlockItem?.note || '',
+        resolution: carriedResolvedAmount > 0 ? 'cozuldu' : 'cozulmedi',
+        resultList: 'merkez',
+        resolvedAmount: carriedResolvedAmount,
+        createdBy: latestBlockItem?.createdBy || currentUser.displayName,
+      };
+
+      if (hasOpenBlock && latestBlockItem?.id) updatedBlockItems.push(syncedBlockItem);
+      else newBlockItems.push(syncedBlockItem);
+    } else if (hasOpenBlock && latestBlockItem?.id) {
+      let resultList = 'merkez';
+      let resolution = 'cozulmedi';
+
+      if (nextStatus === 'pasif') {
+        resultList = 'kapandi';
+        resolution = 'cozuldu';
+      } else if (isPositiveStatus(nextStatus)) {
+        resultList = 'aktif_alindi';
+        resolution = 'cozuldu';
       }
+
+      updatedBlockItems.push({
+        id: latestBlockItem.id,
+        sourceRowKey,
+        date: selectedDay,
+        personName: nextRow.personName,
+        accountName: nextRow.accountName,
+        amount: Number(latestBlockItem.amount || nextRow.amount || 0),
+        type: normalizeBlockedStatus(latestBlockItem.type || previousStatus),
+        note: nextRow.note || latestBlockItem.note || 'Durum tablosundan guncellendi',
+        resolution,
+        resultList,
+        resolvedAmount: Number(latestBlockItem.resolvedAmount || 0),
+        createdBy: latestBlockItem.createdBy || currentUser.displayName,
+      });
     }
 
     return {
@@ -1078,6 +1818,28 @@ async function saveSetDurumu() {
     const { error: txError } = await supabase.from('transactions').upsert(txPayload, { onConflict: 'row_key' });
     if (txError) throw txError;
 
+    if (updatedBlockItems.length) {
+      await Promise.all(
+        updatedBlockItems.map(async (item) => {
+          const { error: blockError } = await supabase
+            .from('blocks')
+            .update({
+              date: item.date,
+              person_name: item.personName,
+              account_name: item.accountName,
+              amount: Number(item.amount || 0),
+              type: normalizeBlockedStatus(item.type),
+              note: item.note || '',
+              resolution: item.resolution,
+              result_list: item.resultList,
+              resolved_amount: Number(item.resolvedAmount || 0),
+            })
+            .eq('id', item.id);
+          if (blockError) throw blockError;
+        })
+      );
+    }
+
     if (newBlockItems.length) {
       const blockPayload = newBlockItems.map((item) => ({
         source_row_key: item.sourceRowKey,
@@ -1103,10 +1865,8 @@ async function saveSetDurumu() {
     if (pendingSection) {
       if (pendingSection === 'logout') {
         setPendingSection(null);
-        try {
-          window.localStorage.removeItem(STORAGE_CURRENT_USER);
-          window.history.replaceState({}, '', window.location.pathname);
-        } catch {}
+        clearStoredCurrentUser();
+        setLogin({ username: '', password: '' });
         setCurrentUser(null);
       } else {
         setActiveSection(pendingSection);
@@ -1146,21 +1906,68 @@ async function saveSetDurumu() {
   }
 
   function handleLogout() {
-    if (showUsersPanel && hasUnsavedUserPanel()) {
-      showActionNotice('Kaydetmeden çıkamazsınız', 'Önce kullanıcı panelindeki değişiklikleri kaydedin.', 'danger');
-      return;
-    }
     if (hasUnsavedAny()) {
       setPendingSection('logout');
       setNavigationWarningMessage('Lütfen girdiğiniz verileri kaydedin.');
       setNavigationWarningOpen(true);
       return;
     }
-    try {
-      window.localStorage.removeItem(STORAGE_CURRENT_USER);
-      window.history.replaceState({}, '', window.location.pathname);
-    } catch {}
+    clearStoredCurrentUser();
+    setLogin({ username: '', password: '' });
     setCurrentUser(null);
+  }
+
+  async function createOrRestoreUser(draftUser) {
+    const displayName = normalizeDisplayName(draftUser.displayName);
+    const username = normalizeUsername(draftUser.username);
+    const password = String(draftUser.password || '').trim();
+
+    if (!displayName || !username || !password) {
+      throw new Error('Yeni kullanıcı için ad, kullanıcı adı ve şifre zorunludur.');
+    }
+
+    const { data: existingUsers, error: existingError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('username', username)
+      .order('created_at', { ascending: false });
+
+    if (existingError) throw existingError;
+
+    const activeMatch = (existingUsers || []).find((user) => Boolean(user.is_active ?? user.isActive));
+    if (activeMatch) {
+      throw new Error('Bu kullanıcı adı zaten kullanılıyor.');
+    }
+
+    const inactiveMatch = (existingUsers || [])[0];
+    if (inactiveMatch) {
+      const { error: restoreError } = await supabase
+        .from('users')
+        .update({
+          username,
+          password,
+          role: draftUser.role,
+          display_name: displayName,
+          is_active: true,
+          can_enter_data: true,
+        })
+        .eq('id', inactiveMatch.id);
+
+      if (restoreError) throw restoreError;
+      return { action: 'restored', displayName };
+    }
+
+    const { error: createError } = await supabase.from('users').insert({
+      username,
+      password,
+      role: draftUser.role,
+      display_name: displayName,
+      is_active: true,
+      can_enter_data: true,
+    });
+
+    if (createError) throw createError;
+    return { action: 'created', displayName };
   }
 
 async function saveUserPanelChanges() {
@@ -1200,9 +2007,20 @@ async function saveUserPanelChanges() {
     let createdUserName = '';
 
     if (hasNewUserDraft) {
-      const displayName = newUserForm.displayName.trim().toUpperCase();
-      const username = newUserForm.username.trim().toLowerCase();
-      const password = newUserForm.password.trim();
+      const createdUser = await createOrRestoreUser(newUserForm);
+      createdUserName = createdUser.displayName;
+      setNewUserForm({ displayName: '', username: '', password: '', role: 'user' });
+      await loadUsersFromDb();
+      setPasswordDrafts({});
+      setUserPermissionDrafts({});
+
+      if (updatedNames.length > 0) {
+        showActionNotice('KullanÄ±cÄ± bÃ¶lÃ¼mÃ¼ kaydedildi', `${updatedNames.length} ÅŸifre gÃ¼ncellendi ve ${createdUserName} eklendi.`);
+      } else {
+        showActionNotice('KullanÄ±cÄ± oluÅŸturuldu', `${createdUserName} eklendi.`);
+      }
+
+      return true;
 
       if (!displayName || !username || !password) {
         showActionNotice('Hata', 'Yeni kullanıcı formunu tamamlamadan devam edemezsiniz.', 'danger');
@@ -1250,28 +2068,6 @@ async function saveUserPanelChanges() {
 
 
   async function handleWarningSaveAndContinue() {
-    if (showUsersPanel && hasUnsavedUserPanel()) {
-      const ok = await saveUserPanelChanges();
-      if (!ok) return;
-
-      setNavigationWarningOpen(false);
-      if (pendingSection === 'logout') {
-        setPendingSection(null);
-        setShowUsersPanel(false);
-        setCurrentUser(null);
-        return;
-      }
-      if (pendingSection === 'close_users_panel' || !pendingSection) {
-        setPendingSection(null);
-        setShowUsersPanel(false);
-        return;
-      }
-      setShowUsersPanel(false);
-      setActiveSection(pendingSection);
-      setPendingSection(null);
-      return;
-    }
-
     if (activeSection === 'giris') {
       await addOrUpdatePerson();
       return;
@@ -1285,6 +2081,8 @@ async function saveUserPanelChanges() {
     setNavigationWarningOpen(false);
     if (pendingSection === 'logout') {
       setPendingSection(null);
+      clearStoredCurrentUser();
+      setLogin({ username: '', password: '' });
       setCurrentUser(null);
       return;
     }
@@ -1319,7 +2117,7 @@ async function saveUserPanelChanges() {
   function resetPersonForm() {
     setEditingPersonId(null);
     setNewPersonName('');
-    setNewPersonDate(TODAY);
+    setNewPersonDate(selectedDay);
     setNewAccountCount('5');
     setNewAccountNames(DEFAULT_ACCOUNT_NAMES);
   }
@@ -1362,8 +2160,13 @@ async function removeCustomBank(bankName) {
 
     const count = Number(newAccountCount || 0);
     const finalNames = newAccountNames.slice(0, count).map((name) => name.trim());
+    const hasDuplicateAccounts = new Set(finalNames.map((name) => name.toLocaleLowerCase('tr-TR'))).size !== finalNames.length;
     if (finalNames.length !== count || finalNames.some((name) => !name)) {
       return showActionNotice('Hata', 'Seçtiğiniz hesap sayısı kadar banka seçmek zorunlu.', 'danger');
+    }
+
+    if (hasDuplicateAccounts) {
+      return showActionNotice('Hata', 'Ayni banka ayni sette birden fazla kez kullanilamaz.', 'danger');
     }
 
     const nextFullName = newPersonName.trim().toUpperCase();
@@ -1383,6 +2186,116 @@ async function removeCustomBank(bankName) {
           .update({ full_name: nextFullName, start_date: newPersonDate })
           .eq('id', editingPersonId);
         if (peopleError) throw peopleError;
+
+        {
+        const existingAccounts = original.accounts || [];
+        const existingAccountByName = new Map(existingAccounts.map((account) => [account.bankName, account]));
+        const retainedAccountIds = new Set();
+        const accountOrderUpdates = [];
+        const newAccountPayload = [];
+
+        finalNames.forEach((bankName, index) => {
+          const existingAccount = existingAccountByName.get(bankName);
+          if (existingAccount) {
+            retainedAccountIds.add(existingAccount.id);
+            if (Number(existingAccount.sortOrder || 0) !== index + 1) {
+              accountOrderUpdates.push({ id: existingAccount.id, sort_order: index + 1 });
+            }
+            return;
+          }
+
+          newAccountPayload.push({
+            person_id: editingPersonId,
+            bank_name: bankName,
+            sort_order: index + 1,
+          });
+        });
+
+        for (const accountUpdate of accountOrderUpdates) {
+          const { error: updateAccountError } = await supabase
+            .from('accounts')
+            .update({ sort_order: accountUpdate.sort_order })
+            .eq('id', accountUpdate.id);
+          if (updateAccountError) throw updateAccountError;
+        }
+
+        const removedAccountIds = existingAccounts
+          .filter((account) => !retainedAccountIds.has(account.id))
+          .map((account) => account.id);
+
+        if (removedAccountIds.length) {
+          const { error: deleteAccountsError } = await supabase.from('accounts').delete().in('id', removedAccountIds);
+          if (deleteAccountsError) throw deleteAccountsError;
+        }
+
+        if (newAccountPayload.length) {
+          const { error: insertAccountsError } = await supabase.from('accounts').insert(newAccountPayload);
+          if (insertAccountsError) throw insertAccountsError;
+        }
+
+        const originalAccountNames = original.accountNames || [];
+        const rebuiltTransactions = [];
+        Object.keys(historyByDay).forEach((day) => {
+          finalNames.forEach((accountName, index) => {
+            const fallbackAccountName = originalAccountNames.includes(accountName)
+              ? accountName
+              : originalAccountNames[index] || accountName;
+            const oldRow = (historyByDay[day] || []).find(
+              (row) =>
+                row.personId === editingPersonId &&
+                (row.accountName === accountName || row.accountName === fallbackAccountName)
+            );
+
+            rebuiltTransactions.push({
+              row_key: makeRowKey(day, editingPersonId, accountName),
+              day,
+              person_id: editingPersonId,
+              person_name: nextFullName,
+              account_name: accountName,
+              amount: Number(oldRow?.amount || 0),
+              status: normalizeStatus(oldRow?.status, 'pasif'),
+              note: oldRow?.note || '',
+              edited_by: oldRow?.editedBy || '',
+              edited_at: oldRow?.editedAt || '',
+            });
+          });
+        });
+
+        const { error: deleteTxError } = await supabase.from('transactions').delete().eq('person_id', editingPersonId);
+        if (deleteTxError) throw deleteTxError;
+        if (rebuiltTransactions.length) {
+          const { error: insertTxError } = await supabase.from('transactions').insert(rebuiltTransactions);
+          if (insertTxError) throw insertTxError;
+        }
+
+        const { data: blocksData, error: blocksFetchError } = await supabase
+          .from('blocks')
+          .select('*')
+          .eq('person_name', original.fullName);
+        if (blocksFetchError) throw blocksFetchError;
+
+        for (const block of blocksData || []) {
+          const previousIndex = originalAccountNames.findIndex((name) => name === block.account_name);
+          const mappedAccountName = finalNames.includes(block.account_name)
+            ? block.account_name
+            : finalNames[previousIndex] || finalNames[0] || block.account_name;
+
+          const { error: blockUpdateError } = await supabase
+            .from('blocks')
+            .update({
+              person_name: nextFullName,
+              account_name: mappedAccountName,
+              source_row_key: block.date ? makeRowKey(block.date, editingPersonId, mappedAccountName) : block.source_row_key,
+            })
+            .eq('id', block.id);
+          if (blockUpdateError) throw blockUpdateError;
+        }
+
+        await loadSupabaseAppData();
+        resetPersonForm();
+        showActionNotice('Guncellendi', 'Set bilgileri Supabase uzerinde guncellendi.');
+        return;
+        }
 
         const { error: deleteAccountsError } = await supabase.from('accounts').delete().eq('person_id', editingPersonId);
         if (deleteAccountsError) throw deleteAccountsError;
@@ -1506,7 +2419,7 @@ async function removeCustomBank(bankName) {
     if (!person) return;
     setEditingPersonId(person.id);
     setNewPersonName(person.fullName);
-    setNewPersonDate(person.startDate || TODAY);
+    setNewPersonDate(person.startDate || selectedDay);
     setNewAccountCount(String(person.accountNames.length));
     setNewAccountNames([...person.accountNames]);
     setActiveSection('giris');
@@ -1689,6 +2602,11 @@ async function createNewUser() {
   }
   try {
     setAppLoading(true);
+    const createdUser = await createOrRestoreUser(newUserForm);
+    await loadUsersFromDb();
+    setNewUserForm({ displayName: '', username: '', password: '', role: 'user' });
+    showActionNotice(createdUser.action === 'restored' ? 'Kullanici geri alindi' : 'Kullanici olusturuldu', `${createdUser.displayName} eklendi.`);
+    return;
     const { error } = await supabase.from('users').insert({
       username,
       password,
@@ -1709,10 +2627,146 @@ async function createNewUser() {
 }
 
 
+  function openSetciPaymentModal() {
+    if (!canManage) {
+      showActionNotice('Yetki yok', 'Setci Odemesi kaydini sadece yonetici olusturabilir.', 'danger');
+      return;
+    }
+    if (Object.keys(pendingSetRows).length > 0) {
+      showActionNotice('Bilgi', 'Once durum ekranindaki degisiklikleri kaydedin.');
+      return;
+    }
+    if (!selectedPerson || eligibleSetciRows.length === 0) {
+      showActionNotice('Bilgi', 'Setci Odemesi icin bakiyesi olan AKTIF veya NFC hesap secili olmali.');
+      return;
+    }
+    setSetciPaymentDraft({
+      rowId: eligibleSetciRows[0].id,
+      amount: '',
+      note: '',
+    });
+    setSetciPaymentModalOpen(true);
+  }
+
+  async function saveSetciPayment() {
+    if (!canManage) return;
+
+    const targetRow = selectedRows.find((row) => row.id === setciPaymentDraft.rowId);
+    const paymentAmount = Number(setciPaymentDraft.amount || 0);
+    const paymentNote = String(setciPaymentDraft.note || '').trim();
+
+    if (!targetRow) {
+      showActionNotice('Hata', 'Setci Odemesi icin hesap bulunamadi.', 'danger');
+      return;
+    }
+    if (!isPositiveStatus(targetRow.status)) {
+      showActionNotice('Hata', 'Setci Odemesi sadece AKTIF veya NFC hesaplardan alinabilir.', 'danger');
+      return;
+    }
+    if (!paymentAmount || paymentAmount <= 0) {
+      showActionNotice('Hata', 'Setci Odemesi tutari sifirdan buyuk olmali.', 'danger');
+      return;
+    }
+
+    const currentAmount = Number(targetRow.amount || 0);
+    if (paymentAmount > currentAmount) {
+      showActionNotice('Hata', 'Setci Odemesi mevcut hesap bakiyesini asamaz.', 'danger');
+      return;
+    }
+
+    const now = getTurkeyNow();
+
+    try {
+      setAppLoading(true);
+      const { error: paymentLogError } = await supabase.from('blocks').insert({
+        source_row_key: buildSetciPaymentSourceKey(targetRow.id),
+        date: selectedDay,
+        person_name: targetRow.personName,
+        account_name: targetRow.accountName,
+        amount: paymentAmount,
+        type: 'bloke',
+        note: paymentNote || 'Setci Odemesi',
+        resolution: 'cozuldu',
+        result_list: SETCI_PAYMENT_RESULT,
+        resolved_amount: 0,
+        created_by: currentUser?.displayName || '',
+      });
+      if (paymentLogError) throw paymentLogError;
+
+      const { error: txError } = await supabase
+        .from('transactions')
+        .update({
+          amount: Math.max(0, currentAmount - paymentAmount),
+          edited_by: currentUser?.displayName || '',
+          edited_at: now.dateTime,
+        })
+        .eq('row_key', targetRow.id);
+      if (txError) throw txError;
+
+      await loadSupabaseAppData();
+      setSetciPaymentModalOpen(false);
+      setSetciPaymentDraft({ rowId: '', amount: '', note: '' });
+      showActionNotice('Setci Odemesi kaydedildi', `${targetRow.personName} / ${targetRow.accountName} icin ${formatMoney(paymentAmount)} kaydedildi.`);
+    } catch (err) {
+      showActionNotice('Hata', err?.message || 'Setci Odemesi kaydedilemedi.', 'danger');
+    } finally {
+      setAppLoading(false);
+    }
+  }
+
+  async function saveSetPayment() {
+    if (!setPaymentTargetPerson) {
+      showActionNotice('Bilgi', 'Set odemesi icin once bir set secin.', 'danger');
+      return;
+    }
+
+    const paymentAmount = Math.max(0, Number(setPaymentDraft.month1Amount || 0));
+    const paymentNote = String(setPaymentDraft.month1Note || '').trim();
+    const sourceKey = buildSetPaymentSourceKey(setPaymentTargetPerson.id, 'month_1');
+    const existingPayment = selectedSetPaymentLogs.find((item) => item.sourceRowKey === sourceKey);
+
+    const payload = {
+      source_row_key: sourceKey,
+      date: selectedDay,
+      person_name: setPaymentTargetPerson.fullName,
+      account_name: 'SET ODEMESI / 1. AY',
+      amount: paymentAmount,
+      type: 'pasif',
+      note: paymentNote || 'Set odemesi',
+      resolution: setPaymentDraft.month1Status === 'odendi' ? 'odendi' : 'odenmedi',
+      result_list: SET_PAYMENT_RESULT,
+      resolved_amount: 0,
+      created_by: currentUser?.displayName || '',
+    };
+
+    try {
+      setAppLoading(true);
+
+      if (existingPayment?.id) {
+        const { error } = await supabase.from('blocks').update(payload).eq('id', existingPayment.id);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from('blocks').insert(payload);
+        if (error) throw error;
+      }
+
+      await loadSupabaseAppData();
+      showActionNotice(
+        'Set odemesi kaydedildi',
+        `${setPaymentTargetPerson.fullName} icin 1. ay durumu ${getSetPaymentStatusLabel(payload.resolution)} olarak guncellendi.`
+      );
+    } catch (err) {
+      showActionNotice('Hata', err?.message || 'Set odemesi kaydedilemedi.', 'danger');
+    } finally {
+      setAppLoading(false);
+    }
+  }
+
   function openBlockResolution(item) {
     if (!canManage) return showActionNotice('Yetki yok', 'Bloke merkezini sadece yönetici düzenleyebilir.', 'danger');
     setSelectedBlockItem(item);
     setResolvedAmountInput(item.resolvedAmount ? String(item.resolvedAmount) : String(item.amount || 0));
+    setBlockNoteInput(item.note || historyRowByKey.get(item.sourceRowKey)?.note || '');
     setShowResolvedAmountInput(false);
     setPendingResolveMode('cozuldu');
     setBlockDialogOpen(true);
@@ -1720,23 +2774,68 @@ async function createNewUser() {
 
 async function setBlockAsResolved(mode = 'cozuldu') {
   if (!selectedBlockItem) return;
+  const nextBlockNote = String(blockNoteInput || '').trim();
+  if (!nextBlockNote) {
+    showActionNotice('Hata', 'Bu islem icin aciklama (not) girmek zorunludur', 'danger');
+    return;
+  }
   if (mode !== 'cozulmedi' && !showResolvedAmountInput) {
     setPendingResolveMode(mode);
     setShowResolvedAmountInput(true);
     return;
   }
 
-  const finalResolvedAmount = Number(resolvedAmountInput || 0);
+  const finalResolvedAmount = Math.max(
+    0,
+    Math.min(Number(selectedBlockItem?.amount || 0), Number(resolvedAmountInput || 0))
+  );
   const now = getTurkeyNow();
   let payload;
-  if (mode === 'aktif_alindi') payload = { resolution: 'cozuldu', result_list: 'aktif_alindi', resolved_amount: 0 };
-  else if (mode === 'kapandi') payload = { resolution: 'cozuldu', result_list: 'kapandi', resolved_amount: 0 };
-  else if (mode === 'cozulmedi') payload = { resolution: 'cozulmedi', result_list: 'merkez', resolved_amount: 0 };
-  else payload = { resolution: Number(finalResolvedAmount || 0) > 0 ? 'cozuldu' : 'cozuldu', result_list: 'merkez', resolved_amount: Math.max(0, Number(finalResolvedAmount || 0)) };
+  if (mode === 'aktif_alindi') payload = { resolution: 'cozuldu', result_list: 'aktif_alindi', resolved_amount: 0, note: nextBlockNote };
+  else if (mode === 'kapandi') payload = { resolution: 'cozuldu', result_list: 'kapandi', resolved_amount: 0, note: nextBlockNote };
+  else if (mode === 'cozulmedi') payload = { resolution: 'cozulmedi', result_list: 'merkez', resolved_amount: 0, note: nextBlockNote };
+  else payload = { resolution: 'cozuldu', result_list: 'merkez', resolved_amount: finalResolvedAmount, note: nextBlockNote };
 
   try {
     setAppLoading(true);
-    const { error } = await supabase.from('blocks').update(payload).eq('id', selectedBlockItem.id);
+    let targetBlockId = selectedBlockItem.id;
+
+    if (!targetBlockId || selectedBlockItem.isDerived) {
+      const { data: existingRows, error: existingRowsError } = await supabase
+        .from('blocks')
+        .select('*')
+        .eq('source_row_key', selectedBlockItem.sourceRowKey)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (existingRowsError) throw existingRowsError;
+
+      const latestExistingBlock = existingRows?.[0] ? normalizeBlockRecord(existingRows[0]) : null;
+      if (latestExistingBlock && getBlockLifecycleState(latestExistingBlock) === 'unresolved') {
+        targetBlockId = latestExistingBlock.id;
+      } else {
+        const { data: insertedBlock, error: insertError } = await supabase
+          .from('blocks')
+          .insert({
+            source_row_key: selectedBlockItem.sourceRowKey,
+            date: selectedBlockItem.date || selectedDay,
+            person_name: selectedBlockItem.personName,
+            account_name: selectedBlockItem.accountName,
+            amount: Number(selectedBlockItem.amount || 0),
+            type: normalizeBlockedStatus(selectedBlockItem.type),
+            note: nextBlockNote,
+            resolution: 'cozulmedi',
+            result_list: 'merkez',
+            resolved_amount: 0,
+            created_by: currentUser?.displayName || selectedBlockItem.createdBy || '',
+          })
+          .select('*')
+          .single();
+        if (insertError) throw insertError;
+        targetBlockId = insertedBlock?.id;
+      }
+    }
+
+    const { error } = await supabase.from('blocks').update(payload).eq('id', targetBlockId);
     if (error) throw error;
 
     if (selectedBlockItem.sourceRowKey) {
@@ -1744,6 +2843,7 @@ async function setBlockAsResolved(mode = 'cozuldu') {
       let txPatch = {
         edited_by: currentUser?.displayName || selectedBlockItem.createdBy || '',
         edited_at: now.dateTime,
+        note: nextBlockNote,
       };
 
       if (mode === 'aktif_alindi') {
@@ -1753,7 +2853,7 @@ async function setBlockAsResolved(mode = 'cozuldu') {
       } else if (mode === 'cozulmedi') {
         txPatch = { ...txPatch, status: blockedStatus };
       } else {
-        const isFullyResolved = Math.max(0, Number(finalResolvedAmount || 0)) >= Number(selectedBlockItem.amount || 0);
+        const isFullyResolved = finalResolvedAmount >= Number(selectedBlockItem.amount || 0);
         txPatch = { ...txPatch, status: isFullyResolved ? 'aktif' : blockedStatus };
       }
 
@@ -1765,6 +2865,7 @@ async function setBlockAsResolved(mode = 'cozuldu') {
     setBlockDialogOpen(false);
     setSelectedBlockItem(null);
     setResolvedAmountInput('');
+    setBlockNoteInput('');
     setShowResolvedAmountInput(false);
     setPendingResolveMode('cozuldu');
     showActionNotice('Güncellendi', 'Bloke kaydı Supabase üzerinde güncellendi.');
@@ -1775,12 +2876,6 @@ async function setBlockAsResolved(mode = 'cozuldu') {
   }
 }
 
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_USERS, JSON.stringify(users));
-    } catch {}
-  }, [users]);
 
   useEffect(() => {
     try {
@@ -1800,29 +2895,43 @@ useEffect(() => {
 }, []);
 
 useEffect(() => {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_CURRENT_USER);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    const normalized = normalizeUserRecord(parsed);
-    if (normalized && normalized.isActive && !normalized.isDeleted) {
-      setCurrentUser(normalized);
-    }
-  } catch {}
+  clearStoredCurrentUser();
 }, []);
 
 useEffect(() => {
-  if (!currentUser) return;
+  if (!currentUser) {
+    setDataReady(false);
+    return;
+  }
   loadSupabaseAppData().catch((err) => {
     showActionNotice('Hata', err?.message || 'Supabase verileri yüklenemedi.', 'danger');
   });
 }, [currentUser?.id]);
   useEffect(() => {
     try {
-      if (currentUser) window.localStorage.setItem(STORAGE_CURRENT_USER, JSON.stringify(currentUser));
-      else window.localStorage.removeItem(STORAGE_CURRENT_USER);
+      if (selectedDay) window.localStorage.setItem(STORAGE_REPORT_DAY, selectedDay);
     } catch {}
-  }, [currentUser]);
+  }, [selectedDay]);
+
+  useEffect(() => {
+    if (!reportMenuOpen) return undefined;
+
+    const handlePointerDown = (event) => {
+      if (reportMenuRef.current?.contains(event.target)) return;
+      setReportMenuOpen(false);
+    };
+
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setReportMenuOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [reportMenuOpen]);
 
   useEffect(() => {
     if (!currentUser || !users.length) return;
@@ -1841,15 +2950,28 @@ useEffect(() => {
     }
   }, [visiblePeople, selectedPersonId]);
 
+  useEffect(() => {
+    if (!setPaymentTargetPerson) {
+      setSetPaymentDraft({ month1Status: 'odenmedi', month1Amount: '', month1Note: '' });
+      return;
+    }
+
+    setSetPaymentDraft({
+      month1Status: monthOneSetPayment?.resolution === 'odendi' ? 'odendi' : 'odenmedi',
+      month1Amount: monthOneSetPayment ? String(Number(monthOneSetPayment.amount || 0)) : '',
+      month1Note: monthOneSetPayment?.note || '',
+    });
+  }, [setPaymentTargetPerson?.id, monthOneSetPayment?.id, monthOneSetPayment?.resolution, monthOneSetPayment?.amount, monthOneSetPayment?.note]);
+
 
 useEffect(() => {
-  if (!currentUser) return;
+  if (!currentUser || !dataReady) return;
   if (historyByDay[selectedDay]) return;
-  setHistoryByDay((prev) => ({
-    ...prev,
-    [selectedDay]: buildZeroRowsForPeople(people, selectedDay),
-  }));
-}, [currentUser, people, selectedDay, historyByDay]);
+  const latestDay = getLatestHistoryDay(historyByDay);
+  if (latestDay && latestDay !== selectedDay) {
+    setSelectedDay(latestDay);
+  }
+}, [currentUser, dataReady, selectedDay, historyByDay]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -1861,7 +2983,7 @@ useEffect(() => {
 
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
-  }, [pendingSetRows, hasUnsavedSetBilgiGirisi, activeSection, passwordDrafts, userPermissionDrafts, newUserForm, showUsersPanel]);
+  }, [pendingSetRows, hasUnsavedSetBilgiGirisi, activeSection]);
 
   if (!currentUser) {
     return (
@@ -1912,7 +3034,7 @@ useEffect(() => {
             </div>
             <div className="space-y-3">
               <SidebarButton active={activeSection === 'genel'} icon={LayoutDashboard} label="Genel Özet" onClick={() => handleSectionChange('genel')} />
-              <SidebarButton active={activeSection === 'durum'} icon={PieChartIcon} label="Set Durumu" onClick={() => handleSectionChange('durum')} />
+              <SidebarButton active={activeSection === 'durum'} icon={PieChartIcon} label="Durum Ayarla" onClick={() => handleSectionChange('durum')} />
               <SidebarButton active={activeSection === 'bloke'} icon={AlertTriangle} label="Bloke Takibi" onClick={() => handleSectionChange('bloke')} />
               <SidebarButton active={activeSection === 'giris'} icon={UserRound} label="Set Bilgi Girişi" onClick={() => handleSectionChange('giris')} />
 
@@ -1939,25 +3061,46 @@ useEffect(() => {
                       value={selectedDay}
                       onChange={(e) => {
                         ensureDay(e.target.value);
-                        setSelectedDay(e.target.value);
                       }}
                       className="max-w-[220px] font-bold"
                     />
                     <Button variant="outline" onClick={startNewDay}>YENİ GÜNE BAŞLA</Button>
-                    <Button variant="outline" onClick={handleExportPDF}>
-                      <Download className="h-4 w-4" /> RAPOR AL
-                    </Button>
-                    <Button variant="outline" onClick={handleExportExcel}>
-                      <FileSpreadsheet className="h-4 w-4" /> EXCEL
-                    </Button>
-                    <Button variant="outline" onClick={handleExportPDF}>
-                      <FileText className="h-4 w-4" /> PDF
-                    </Button>
+                    <ReportMenu
+                      open={reportMenuOpen}
+                      menuRef={reportMenuRef}
+                      selectedPerson={selectedPerson}
+                      onToggle={() => setReportMenuOpen((open) => !open)}
+                      onGeneralPdf={() => {
+                        setReportMenuOpen(false);
+                        handleExportPDF();
+                      }}
+                      onGeneralExcel={() => {
+                        setReportMenuOpen(false);
+                        handleExportExcel();
+                      }}
+                      onPersonPdf={() => {
+                        if (!selectedPerson) return;
+                        setReportMenuOpen(false);
+                        handlePersonExportPDF();
+                      }}
+                      onPersonExcel={() => {
+                        if (!selectedPerson) return;
+                        setReportMenuOpen(false);
+                        handlePersonExportExcel();
+                      }}
+                    />
+                  </div>
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2">
+                    <div className="flex items-center gap-2 text-sm font-black text-slate-700">
+                      <span className={`h-2 w-2 rounded-full ${onlineUsers.length ? 'bg-teal-500' : 'bg-slate-400'}`} />
+                      {onlineUsersSummary.title}
+                    </div>
+                    <div className="mt-1 text-xs font-bold text-slate-500">{onlineUsersSummary.detail}</div>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700">
-                  <span className="h-2 w-2 rounded-full bg-slate-400" />
+                <div className="hidden items-center gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-bold text-slate-700">
+                  <span className={`h-2 w-2 rounded-full ${onlineUsers.length ? 'bg-teal-500' : 'bg-slate-400'}`} />
                   Aktif veri girişi yok
                 </div>
               </div>
@@ -1971,18 +3114,22 @@ useEffect(() => {
                     <BellRing className="h-4 w-4" /> BİLDİRİM GÖNDER
                   </Button>
                 )}
-                {canManage && (
-                  <Button variant="outline" onClick={() => setShowUsersPanel(true)}>
-                    <Settings className="h-4 w-4" /> KULLANICILAR
-                  </Button>
-                )}
               </div>
             </div>
           </Card>
 
           {activeSection === 'genel' && (
             <>
-              <div className="grid gap-4 xl:grid-cols-4">
+              <div className={`grid gap-4 ${canManage ? 'xl:grid-cols-5' : 'xl:grid-cols-4'}`}>
+                {canManage && (
+                  <SummaryCard
+                    title="SETCI ODEMESI"
+                    value={formatMoney(setciPaymentSummary.amount)}
+                    subtitle={`Bugun alinan: ${setciPaymentSummary.count}`}
+                    tone="cyan"
+                    onClick={() => setSelectedGeneralSummary('setci')}
+                  />
+                )}
                 <SummaryCard title="AKTİF + NFC BAKİYE" value={formatMoney(groupedTotals.positiveAmount)} subtitle={`Hesap sayısı: ${groupedTotals.positiveCount}`} tone="teal" onClick={() => setSelectedGeneralSummary('positive')} />
                 <SummaryCard title="BLOKE + ŞİFRE KİLİT" value={formatMoney(groupedTotals.negativeAmount)} subtitle={`Hesap sayısı: ${groupedTotals.negativeCount}`} tone="rose" onClick={() => setSelectedGeneralSummary('negative')} />
                 <SummaryCard title="AKTİFE ALINAN HESAPLAR" value={groupedTotals.activatedCount} subtitle={`Aktife alınan tutar: ${formatMoney(groupedTotals.activatedAmount)}`} tone="cyan" onClick={() => setSelectedGeneralSummary('activated')} />
@@ -2034,14 +3181,41 @@ useEffect(() => {
           {activeSection === 'durum' && (
             <>
               <Card>
-                <div className="grid gap-4 p-6 xl:grid-cols-[280px_1fr] xl:items-end">
-                  <div>
+                <div className="grid gap-5 p-6 xl:grid-cols-[280px_minmax(0,1fr)] xl:items-start">
+                  <div className="space-y-4">
                     <div className="mb-2 text-sm font-black">ŞAHIS SEÇ</div>
                     <SelectBox value={selectedPersonId} onChange={(e) => setSelectedPersonId(e.target.value)}>
                       {visiblePeople.map((p) => (
                         <option key={p.id} value={p.id}>{p.fullName}</option>
                       ))}
                     </SelectBox>
+                    {selectedPerson && (
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-bold text-slate-600">
+                          <div className="text-[11px] font-black tracking-[0.16em] text-slate-500">SET ALINMA TARIHI</div>
+                          <div className="mt-2 text-sm font-black text-slate-950">{selectedPerson.startDate || '-'}</div>
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-bold text-slate-600">
+                          <div className="text-[11px] font-black tracking-[0.16em] text-slate-500">BANKA SAYISI</div>
+                          <div className="mt-2 text-sm font-black text-slate-950">{selectedPerson.accountNames.length}</div>
+                        </div>
+                      </div>
+                    )}
+                    {canManage && (
+                      <div className="flex flex-wrap gap-2">
+                        <Button variant="outline" className="w-full sm:w-auto" onClick={openSetciPaymentModal}>
+                          <Plus className="h-4 w-4" /> SETCI ODEMESI
+                        </Button>
+                      </div>
+                    )}
+                    {canManage && (
+                      <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-bold text-slate-600">
+                        Secili kisinin AKTIF veya NFC hesabindan dusulen Setci Odemesi burada kayda alinir.
+                      </div>
+                    )}
+                    <div className="hidden rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-bold text-slate-600">
+                      Set duzenleme islemleri Set Bilgi Girisi ekranindan yapilir.
+                    </div>
                   </div>
                   <div className="space-y-4">
                     <div className="grid gap-4 md:grid-cols-3">
@@ -2049,7 +3223,10 @@ useEffect(() => {
                       <SummaryCard title="AKTİF + NFC" value={formatMoney(personTotals.activeAmount)} subtitle="Olumlu durum" tone="teal" />
                       <SummaryCard title="BLOKE + ŞİFRE KİLİT" value={formatMoney(personTotals.lockedAmount)} subtitle="Olumsuz durum" tone="rose" />
                     </div>
-                    <div className="flex flex-wrap gap-2">
+                    <div className="hidden rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-bold text-slate-600">
+                      Set duzenleme islemleri Set Bilgi Girisi ekranindan yapilir.
+                    </div>
+                    <div className="hidden flex-wrap gap-2">
                       <Button variant="outline" onClick={() => beginEditPerson(selectedPersonId)}>
                         <Pencil className="h-4 w-4" /> DÜZENLE
                       </Button>
@@ -2087,16 +3264,16 @@ useEffect(() => {
                         const isPending = !!pendingSetRows[row.id];
                         const liveRow = pendingSetRows[row.id] || row;
                         const liveStatus = normalizeStatus(liveRow.status, 'pasif');
+                        const persistedRow = (historyByDay[selectedDay] || []).find((item) => item.id === row.id);
+                        const statusLockedForUser = !canManage && isManagerLockedStatus(persistedRow?.status);
                         return (
                           <div key={row.id} className={`grid grid-cols-[1.2fr_140px_180px_1fr_170px_220px] items-center gap-3 border-t border-slate-200 px-4 py-3 transition ${isPending ? 'bg-amber-50' : 'bg-white hover:bg-slate-50'}`}>
                             <div className="font-black text-slate-900">{liveRow.accountName}</div>
                             <Input type="number" value={liveRow.amount} onChange={(e) => updateRow(row.id, 'amount', e.target.value)} className="font-bold" />
-                            <SelectBox value={liveStatus} onChange={(e) => updateRow(row.id, 'status', e.target.value)} className="font-bold">
-                              <option value="pasif">PASİF</option>
-                              <option value="aktif">AKTİF</option>
-                              <option value="nfc">NFC</option>
-                              <option value="sifre_kilit">ŞİFRE KİLİT</option>
-                              <option value="bloke">BLOKE</option>
+                            <SelectBox value={liveStatus} onChange={(e) => updateRow(row.id, 'status', e.target.value)} className="font-bold" disabled={statusLockedForUser}>
+                              {STATUS_SELECT_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>{option.label}</option>
+                              ))}
                             </SelectBox>
                             <Input value={liveRow.note} onChange={(e) => updateRow(row.id, 'note', e.target.value)} placeholder="Not" className="font-bold" />
                             <div><StatusBadge status={liveStatus} /></div>
@@ -2130,6 +3307,27 @@ useEffect(() => {
                       <Button variant="ghost" onClick={resetPersonForm}>İPTAL</Button>
                     )}
                   </div>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <Button variant="outline" onClick={resetPersonForm}>
+                      <Plus className="h-4 w-4" /> YENI EKLE
+                    </Button>
+                    {selectedPersonId && (
+                      <Button variant="outline" onClick={() => beginEditPerson(selectedPersonId)}>
+                        <Pencil className="h-4 w-4" /> DUZENLE
+                      </Button>
+                    )}
+                    {selectedPersonId && canManage && (
+                      <Button
+                        variant="danger"
+                        onClick={() => {
+                          const target = people.find((p) => p.id === selectedPersonId);
+                          if (target) setDeleteSetTarget(target);
+                        }}
+                      >
+                        <Trash2 className="h-4 w-4" /> SIL
+                      </Button>
+                    )}
+                  </div>
                   <div className="grid gap-4 xl:grid-cols-3">
                     <div>
                       <div className="mb-2 text-sm font-black">AD SOYAD</div>
@@ -2156,7 +3354,7 @@ useEffect(() => {
                       </SelectBox>
                     </div>
                     <div>
-                      <div className="mb-2 text-sm font-black">TARİH</div>
+                      <div className="mb-2 text-sm font-black">SET ALINMA TARIHI</div>
                       <Input type="date" value={newPersonDate} onChange={(e) => setNewPersonDate(e.target.value)} className="font-bold" />
                     </div>
                   </div>
@@ -2214,6 +3412,15 @@ useEffect(() => {
                     </div>
                   </div>
 
+                  <SetPaymentsPanel
+                    person={setPaymentTargetPerson}
+                    draft={setPaymentDraft}
+                    setDraft={setSetPaymentDraft}
+                    onSave={saveSetPayment}
+                    savedPayment={monthOneSetPayment}
+                    formatDisplayDateTime={formatDisplayDateTime}
+                  />
+
                   <div className="flex justify-end gap-2">
                     <Button variant="outline" onClick={resetPersonForm}>TEMİZLE</Button>
                     <Button onClick={addOrUpdatePerson}><Plus className="h-4 w-4" /> {editingPersonId ? 'GÜNCELLE' : 'KAYDET'}</Button>
@@ -2232,9 +3439,23 @@ useEffect(() => {
                       <div className="flex items-start justify-between gap-4">
                         <div>
                           <div className="font-black text-slate-950">{person.fullName}</div>
-                          <div className="mt-1 text-sm font-semibold text-slate-500">Tarih: {person.startDate || '-'}</div>
+                          <div className="mt-1 text-sm font-semibold text-slate-500">Set alinma tarihi: {person.startDate || '-'}</div>
+                          <div className="mt-1 text-xs font-bold text-slate-500">
+                            1. Ay odemesi:{' '}
+                            {getSetPaymentStatusLabel(
+                              allSetPaymentRows.find((item) => item.personId === person.id && item.monthKey === 'month_1')?.resolution || 'odenmedi'
+                            )}
+                          </div>
                         </div>
                         <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-black text-slate-700">{person.accountNames.length} banka</span>
+                      </div>
+                      <div className="mt-3 grid gap-2 md:grid-cols-2">
+                        {(person.accounts || []).map((account) => (
+                          <div key={account.id} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                            <div className="text-sm font-black text-slate-900">{account.bankName}</div>
+                            <div className="mt-1 text-xs font-bold text-slate-500">Eklenme: {formatDisplayDateTime(account.createdAt)}</div>
+                          </div>
+                        ))}
                       </div>
                       <div className="mt-4 flex flex-wrap gap-2">
                         <Button variant="outline" onClick={() => { setSelectedPersonId(person.id); setActiveSection('durum'); }}>
@@ -2301,9 +3522,15 @@ useEffect(() => {
                               <div className="font-black text-slate-950">{item.personName} • {item.accountName}</div>
                               <div className="text-xs font-bold text-slate-500">{item.date} • {item.createdBy} • {item.note || 'Not yok'}</div>
                             </div>
-                            <div className="font-black text-slate-900">{formatMoney(getCurrentBlockedAmount(item))}</div>
+                            <div>
+                              <div className="font-black text-slate-900">{formatMoney(getCurrentBlockedAmount(item))}</div>
+                              <div className="mt-1 text-xs font-bold text-slate-500">{getBlockCreatedDisplayValue(item)}</div>
+                            </div>
                             <div><StatusBadge status={item.type} /></div>
-                            <div className={`font-black ${getBlockResultMeta(item).className}`}>{getBlockResultMeta(item).label}</div>
+                            <div>
+                              <div className={`font-black ${getBlockResultMeta(item).className}`}>{getBlockResultMeta(item).label}</div>
+                              <div className="mt-1 text-xs font-bold text-slate-500">{formatDisplayDateTime(getBlockChangedAt(item, historyRowByKey))}</div>
+                            </div>
                             <Button variant="outline" onClick={() => openBlockResolution(item)}>DURUM GÜNCELLE</Button>
                           </div>
                         ))
@@ -2317,77 +3544,20 @@ useEffect(() => {
         </main>
       </div>
 
-      {canManage && (
-        <Modal open={showUsersPanel} onClose={() => {
-          if (hasUnsavedUserPanel()) {
-            showActionNotice('Kaydetmeden çıkamazsınız', 'Önce kullanıcı panelindeki değişiklikleri kaydedin.', 'danger');
-            return;
-          }
-          setShowUsersPanel(false);
-        }} title="KULLANICI YÖNETİMİ" maxWidth="max-w-6xl">
-          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5">
-            <div className="mb-4 text-sm font-black tracking-[0.18em] text-slate-600">YENİ KULLANICI OLUŞTUR</div>
-            <div className="grid gap-3 xl:grid-cols-[1.1fr_1fr_1fr_220px_auto] xl:items-end">
-              <div>
-                <div className="mb-2 block text-sm font-black">AD SOYAD</div>
-                <Input placeholder="Ad Soyad" value={newUserForm.displayName} onChange={(e) => setNewUserForm((p) => ({ ...p, displayName: e.target.value }))} />
-              </div>
-              <div>
-                <div className="mb-2 block text-sm font-black">KULLANICI ADI</div>
-                <Input placeholder="Kullanıcı adı" value={newUserForm.username} onChange={(e) => setNewUserForm((p) => ({ ...p, username: e.target.value }))} />
-              </div>
-              <div>
-                <div className="mb-2 block text-sm font-black">ŞİFRE</div>
-                <Input type="password" placeholder="Şifre" value={newUserForm.password} onChange={(e) => setNewUserForm((p) => ({ ...p, password: e.target.value }))} />
-              </div>
-              <div>
-                <div className="mb-2 block text-sm font-black">ROL</div>
-                <SelectBox value={newUserForm.role} onChange={(e) => setNewUserForm((p) => ({ ...p, role: e.target.value }))}>
-                  <option value="user">KULLANICI</option>
-                  <option value="admin">YÖNETİCİ</option>
-                </SelectBox>
-              </div>
-              <Button type="button" onClick={createNewUser} className="h-10 xl:px-5"><Plus className="h-4 w-4" /> OLUŞTUR</Button>
-            </div>
-          </div>
-
-          <div className="mt-5 overflow-hidden rounded-2xl border border-slate-200">
-            <div className="grid grid-cols-[1.2fr_140px_170px_170px_1.2fr] items-center gap-3 bg-slate-900 px-4 py-3 text-xs font-black tracking-[0.18em] text-white">
-              <div>KULLANICI</div>
-              <div>ROL</div>
-              <div>DURUM</div>
-              <div>YETKİ</div>
-              <div>ŞİFRE / İŞLEM</div>
-            </div>
-            <div className="max-h-[46vh] overflow-auto bg-white">
-              {users.filter((u) => !u.isDeleted).map((u) => (
-                <div key={u.id} className="grid grid-cols-[1.2fr_140px_170px_170px_1.2fr] items-center gap-3 border-t border-slate-200 px-4 py-4">
-                  <div className="min-w-0">
-                    <div className="truncate font-black text-slate-950">{u.displayName}</div>
-                    <div className="mt-1 text-xs font-bold text-slate-500">{u.username}</div>
-                  </div>
-                  <div className="font-black text-slate-700">{u.role === 'admin' ? 'YÖNETİCİ' : 'KULLANICI'}</div>
-                  <div className="flex items-center gap-3">
-                    <input type="checkbox" checked={getPanelUser(u).isActive} disabled={u.role === 'admin'} onChange={() => toggleUser(u.id, 'isActive')} />
-                    <span className="text-sm font-black text-slate-700">{getPanelUser(u).isActive ? 'AKTİF' : 'PASİF'}</span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <input type="checkbox" checked={getPanelUser(u).canEnterData} disabled={u.role === 'admin'} onChange={() => toggleUser(u.id, 'canEnterData')} />
-                    <span className="text-sm font-black text-slate-700">VERİ GİRİŞİ</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Input type="password" placeholder="Yeni şifre" value={passwordDrafts[u.id] || ''} onChange={(e) => setPasswordDrafts((p) => ({ ...p, [u.id]: e.target.value }))} className="min-w-0" />
-                    <Button type="button" variant="outline" className="shrink-0" onClick={() => saveUserRow(u.id)}>KAYDET</Button>
-                    {u.role !== 'admin' && (
-                      <Button type="button" variant="danger" className="shrink-0" onClick={() => deleteUser(u.id)}>SİL</Button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </Modal>
-      )}
+      <SetciPaymentModal
+        open={setciPaymentModalOpen}
+        onClose={() => {
+          setSetciPaymentModalOpen(false);
+          setSetciPaymentDraft({ rowId: '', amount: '', note: '' });
+        }}
+        selectedPerson={selectedPerson}
+        selectedDay={selectedDay}
+        draft={setciPaymentDraft}
+        setDraft={setSetciPaymentDraft}
+        eligibleRows={eligibleSetciRows}
+        formatMoney={formatMoney}
+        onSave={saveSetciPayment}
+      />
 
       {actionNotice.open && (
         <div className="fixed right-6 top-6 z-[140] min-w-[320px] rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
@@ -2395,18 +3565,6 @@ useEffect(() => {
           <div className="mt-1 text-sm font-semibold text-slate-600">{actionNotice.message}</div>
         </div>
       )}
-
-      <Modal open={!!deleteTargetUser} onClose={() => setDeleteTargetUser(null)} title="KULLANICIYI SİL" maxWidth="max-w-md">
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm font-bold text-rose-800">
-            {deleteTargetUser ? `${deleteTargetUser.displayName} kullanıcısı sistemden tamamen silinecek. Bu işlem geri alınamaz.` : ''}
-          </div>
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" onClick={() => setDeleteTargetUser(null)}>İPTAL</Button>
-            <Button variant="danger" onClick={confirmDeleteUser}>TAMAMEN SİL</Button>
-          </div>
-        </div>
-      </Modal>
 
       <Modal open={!!deleteSetTarget} onClose={() => setDeleteSetTarget(null)} title="SETİ SİL" maxWidth="max-w-md">
         <div className="space-y-4">
@@ -2441,8 +3599,35 @@ useEffect(() => {
         </div>
       </Modal>
 
-      <Modal open={blockDialogOpen} onClose={() => {
+      <BlockStatusModal
+        open={blockDialogOpen}
+        onClose={() => {
+          setBlockDialogOpen(false);
+          setBlockNoteInput('');
+          setShowResolvedAmountInput(false);
+          setPendingResolveMode('cozuldu');
+        }}
+        selectedBlockItem={selectedBlockItem}
+        historyRowByKey={historyRowByKey}
+        blockNoteInput={blockNoteInput}
+        setBlockNoteInput={setBlockNoteInput}
+        showResolvedAmountInput={showResolvedAmountInput}
+        setShowResolvedAmountInput={setShowResolvedAmountInput}
+        resolvedAmountInput={resolvedAmountInput}
+        setResolvedAmountInput={setResolvedAmountInput}
+        pendingResolveMode={pendingResolveMode}
+        setPendingResolveMode={setPendingResolveMode}
+        setBlockAsResolved={setBlockAsResolved}
+        formatMoney={formatMoney}
+        formatDisplayDateTime={formatDisplayDateTime}
+        getBlockCreatedDisplayValue={getBlockCreatedDisplayValue}
+        getBlockChangedAt={getBlockChangedAt}
+        getBlockChangedBy={getBlockChangedBy}
+      />
+
+      {false && (<Modal open={blockDialogOpen} onClose={() => {
         setBlockDialogOpen(false);
+        setBlockNoteInput('');
         setShowResolvedAmountInput(false);
         setPendingResolveMode('cozuldu');
       }} title="BLOKE DURUMU" maxWidth="max-w-xl">
@@ -2453,6 +3638,25 @@ useEffect(() => {
               <div className="mt-1 text-sm font-semibold text-slate-500">{formatMoney(selectedBlockItem.amount)} • {selectedBlockItem.note || 'Not yok'}</div>
             </div>
           )}
+
+          {selectedBlockItem && (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="text-[11px] font-black tracking-[0.16em] text-slate-500">BLOKE OLMA TARIHI</div>
+                <div className="mt-2 text-sm font-black text-slate-900">{getBlockCreatedDisplayValue(selectedBlockItem)}</div>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="text-[11px] font-black tracking-[0.16em] text-slate-500">SON DEGISIKLIK</div>
+                <div className="mt-2 text-sm font-black text-slate-900">{formatDisplayDateTime(getBlockChangedAt(selectedBlockItem, historyRowByKey))}</div>
+                <div className="mt-1 text-xs font-bold text-slate-500">{getBlockChangedBy(selectedBlockItem, historyRowByKey) || selectedBlockItem.createdBy || '-'}</div>
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4">
+            <div className="mb-2 text-sm font-black">NOT</div>
+            <Input value={blockNoteInput} onChange={(e) => setBlockNoteInput(e.target.value)} placeholder="Bloke notu" className="font-bold" />
+          </div>
 
           {showResolvedAmountInput && (
             <div className="rounded-2xl border border-teal-200 bg-teal-50 p-4">
@@ -2476,16 +3680,27 @@ useEffect(() => {
             <Button variant="outline" onClick={() => setBlockAsResolved('kapandi')}>KAPANDI</Button>
           </div>
         </div>
-      </Modal>
+      </Modal>)}
 
-      <Modal open={!!selectedGeneralSummary} onClose={() => setSelectedGeneralSummary(null)} title="DETAY LİSTE" maxWidth="max-w-5xl">
+      <Modal open={!!selectedGeneralSummary} onClose={() => setSelectedGeneralSummary(null)} title={getSummaryModalTitle(selectedGeneralSummary)} maxWidth="max-w-5xl">
         <div className="space-y-3">
           {(selectedGeneralSummary ? generalSummaryDetails[selectedGeneralSummary] : []).length === 0 ? (
             <div className="rounded-2xl border border-slate-200 bg-slate-50 p-6 text-center text-sm font-bold text-slate-500">Kayıt yok</div>
           ) : (
             (selectedGeneralSummary ? generalSummaryDetails[selectedGeneralSummary] : []).map((item, idx) => (
               <div key={idx} className="rounded-2xl border border-slate-200 bg-white p-4">
-                {'accountName' in item ? (
+                {selectedGeneralSummary === 'setci' ? (
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <div className="font-black text-slate-950">{item.personName} â€¢ {item.accountName}</div>
+                      <div className="mt-1 text-sm font-semibold text-slate-500">{item.note || 'Not yok'} â€¢ {item.createdBy || '-'} â€¢ {formatDisplayDateTime(item.createdAt || item.date)}</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="font-black text-slate-950">{formatMoney(item.amount)}</div>
+                      <div className="mt-1 text-sm font-bold text-slate-500">Setci Odemesi</div>
+                    </div>
+                  </div>
+                ) : 'accountName' in item ? (
                   <div className="flex items-center justify-between gap-4">
                     <div>
                       <div className="font-black text-slate-950">{item.personName} • {item.accountName}</div>
@@ -2513,6 +3728,7 @@ useEffect(() => {
           )}
         </div>
       </Modal>
+
     </div>
   );
 }
