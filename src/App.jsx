@@ -3340,21 +3340,68 @@ useEffect(() => {
                         const liveRow = pendingSetRows[row.id] || row;
                         const liveStatus = normalizeStatus(liveRow.status, 'pasif');
                         const persistedRow = (historyByDay[selectedDay] || []).find((item) => item.id === row.id);
+                        const activeBlockItem = currentDayBlockByRowKey.get(row.id) || null;
+                        const blockManagedLifecycle = getBlockLifecycleState(activeBlockItem);
+                        const isBlockManagedRow = blockManagedLifecycle === 'unresolved';
                         const statusLockedForUser = !canManage && isManagerLockedStatus(persistedRow?.status);
+                        const rowTone = isBlockManagedRow
+                          ? liveStatus === 'sifre_kilit'
+                            ? 'bg-amber-50/70 hover:bg-amber-50/80'
+                            : 'bg-rose-50/70 hover:bg-rose-50/80'
+                          : isPending
+                            ? 'bg-amber-50'
+                            : 'bg-white hover:bg-slate-50';
+                        const rowHintClass = liveStatus === 'sifre_kilit' ? 'text-amber-700' : 'text-rose-700';
                         return (
-                          <div key={row.id} className={`grid grid-cols-[1.2fr_140px_180px_1fr_170px_220px] items-center gap-3 border-t border-slate-200 px-4 py-3 transition ${isPending ? 'bg-amber-50' : 'bg-white hover:bg-slate-50'}`}>
-                            <div className="font-black text-slate-900">{liveRow.accountName}</div>
-                            <Input type="number" value={liveRow.amount} onChange={(e) => updateRow(row.id, 'amount', e.target.value)} className="font-bold" />
-                            <SelectBox value={liveStatus} onChange={(e) => updateRow(row.id, 'status', e.target.value)} className="font-bold" disabled={statusLockedForUser}>
+                          <div key={row.id} className={`grid grid-cols-[1.2fr_140px_180px_1fr_170px_220px] items-center gap-3 border-t border-slate-200 px-4 py-3 transition ${rowTone}`}>
+                            <div>
+                              <div className="font-black text-slate-900">{liveRow.accountName}</div>
+                              {isBlockManagedRow && (
+                                <div className={`mt-1 text-[11px] font-black tracking-[0.12em] ${rowHintClass}`}>
+                                  BLOK MERKEZINDEN YONETILIR
+                                </div>
+                              )}
+                            </div>
+                            <Input
+                              type="number"
+                              value={liveRow.amount}
+                              onChange={(e) => updateRow(row.id, 'amount', e.target.value)}
+                              className="font-bold"
+                              disabled={isBlockManagedRow}
+                            />
+                            <SelectBox
+                              value={liveStatus}
+                              onChange={(e) => updateRow(row.id, 'status', e.target.value)}
+                              className="font-bold"
+                              disabled={statusLockedForUser || isBlockManagedRow}
+                            >
                               {STATUS_SELECT_OPTIONS.map((option) => (
                                 <option key={option.value} value={option.value}>{option.label}</option>
                               ))}
                             </SelectBox>
-                            <Input value={liveRow.note} onChange={(e) => updateRow(row.id, 'note', e.target.value)} placeholder="Not" className="font-bold" />
-                            <div><StatusBadge status={liveStatus} /></div>
+                            <Input
+                              value={liveRow.note}
+                              onChange={(e) => updateRow(row.id, 'note', e.target.value)}
+                              placeholder={isBlockManagedRow ? 'Bloke merkezi notu' : 'Not'}
+                              className="font-bold"
+                              disabled={isBlockManagedRow}
+                            />
+                            <div className="space-y-1">
+                              <div><StatusBadge status={liveStatus} /></div>
+                              {isBlockManagedRow && (
+                                <div className={`text-[11px] font-black ${rowHintClass}`}>
+                                  {liveStatus === 'sifre_kilit' ? 'SIFRE KILIT BLOK KAYDI ACIK' : 'BLOKE KAYDI ACIK'}
+                                </div>
+                              )}
+                            </div>
                             <div className="rounded-xl bg-slate-50 px-3 py-2 text-right">
                               <div className="text-sm font-black text-slate-900">{liveRow.editedBy || currentUser?.displayName || '-'}</div>
                               <div className="text-xs font-bold text-slate-500">{liveRow.editedAt || '-'}</div>
+                              {isBlockManagedRow && (
+                                <div className={`mt-1 text-[11px] font-black ${rowHintClass}`}>
+                                  BLOK MERKEZI
+                                </div>
+                              )}
                             </div>
                           </div>
                         );

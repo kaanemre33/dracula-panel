@@ -10,6 +10,16 @@ export const STATUS_META = {
 
 export const VALID_STATUSES = new Set(STATUS_OPTIONS);
 
+function isLegacyBlockedAliasKey(normalizedKey = '') {
+  return (
+    normalizedKey.length === 4 &&
+    normalizedKey.charCodeAt(0) === 97 &&
+    normalizedKey.charCodeAt(1) === 100 &&
+    normalizedKey.charCodeAt(2) === 97 &&
+    normalizedKey.charCodeAt(3) === 109
+  );
+}
+
 export const STATUS_ALIASES = {
   active: 'aktif',
   blocked: 'bloke',
@@ -19,7 +29,6 @@ export const STATUS_ALIASES = {
   sifre: 'sifre_kilit',
   sifrekilit: 'sifre_kilit',
   sifre_kilit: 'sifre_kilit',
-  adam: 'bloke',
 };
 
 export const STATUS_SELECT_OPTIONS = STATUS_OPTIONS.map((value) => ({
@@ -33,13 +42,18 @@ export function toStatusKey(value) {
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\u0131/g, 'i')
+    .replace(/[ç]/g, 'c')
+    .replace(/[ğ]/g, 'g')
+    .replace(/[ö]/g, 'o')
+    .replace(/[ş]/g, 's')
+    .replace(/[ü]/g, 'u')
     .replace(/[Ã§]/g, 'c')
     .replace(/[ÄŸ]/g, 'g')
     .replace(/[Ä±Ä°]/g, 'i')
     .replace(/[Ã¶]/g, 'o')
     .replace(/[ÅŸ]/g, 's')
     .replace(/[Ã¼]/g, 'u')
-    .replace(/[Ä±]/g, 'i')
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
 }
@@ -48,6 +62,7 @@ export function normalizeStatus(value, fallback = 'pasif') {
   const normalized = toStatusKey(value);
   if (!normalized) return fallback;
   if (VALID_STATUSES.has(normalized)) return normalized;
+  if (isLegacyBlockedAliasKey(normalized)) return 'bloke';
   return STATUS_ALIASES[normalized] || fallback;
 }
 
