@@ -56,6 +56,12 @@ import {
   isSetPaymentLog as isSetPaymentLogLib,
   isSetciPaymentLog as isSetciPaymentLogLib,
 } from './lib/payments';
+import {
+  buildLatestBlockMap,
+  collectDuplicateOpenBlockRepairs,
+  collectNegativeStatusBlockRepairs,
+  getBlockLifecycleState,
+} from './lib/blockSync';
 import { appendStructuredSheet, renderPdfHeader, renderPdfSection } from './lib/exportHelpers';
 import { BlockStatusModal } from './components/BlockStatusModal';
 import { ReportMenu } from './components/ReportMenu';
@@ -115,8 +121,8 @@ function getTurkeyNow() {
 
 const TODAY = getTurkeyNow().date;
 const DEFAULT_ACCOUNT_NAMES = DEFAULT_BANKS.slice(0, 5);
-/* legacy inline status block moved to src/lib/status.js
-const STATUS_OPTIONS = ['pasif', 'aktif', 'nfc', 'sifre_kilit', 'bloke'];
+/* legacy inline status notes removed in favor of src/lib/status.js
+legacy status options removed
 
 const STATUS_META = {
   pasif: { label: 'PASİF', className: 'border-slate-200 bg-slate-100 text-slate-700', icon: Ban },
@@ -126,8 +132,8 @@ const STATUS_META = {
   bloke: { label: 'BLOKE', className: 'border-rose-200 bg-rose-100 text-rose-800', icon: AlertTriangle },
 };
 
-const VALID_STATUSES = new Set(['pasif', 'aktif', 'nfc', 'sifre_kilit', 'bloke']);
-const STATUS_ALIASES = {
+legacy valid statuses removed
+legacy aliases removed {
   active: 'aktif',
   blocked: 'bloke',
   block: 'bloke',
@@ -139,7 +145,7 @@ const STATUS_ALIASES = {
   legacy_invalid_status: 'bloke',
 };
 
-function toStatusKey(value) {
+legacy toStatusKey removed {
   return String(value || '')
     .trim()
     .toLowerCase()
@@ -153,17 +159,7 @@ function toStatusKey(value) {
     .replace(/^_+|_+$/g, '');
 }
 
-function normalizeStatus(value, fallback = 'pasif') {
-  const normalized = toStatusKey(value);
-  if (!normalized) return fallback;
-  if (VALID_STATUSES.has(normalized)) return normalized;
-  return STATUS_ALIASES[normalized] || fallback;
-}
-
-function normalizeBlockedStatus(value) {
-  const normalized = normalizeStatus(value, 'bloke');
-  return normalized === 'sifre_kilit' ? 'sifre_kilit' : 'bloke';
-}
+legacy normalize helpers removed
 */
 
 const STATUS_OPTIONS = STATUS_SELECT_OPTIONS.map((item) => item.value);
@@ -375,25 +371,6 @@ function getRowFinancialBreakdown(row, blockItem) {
     negativeAmount,
     releasedAmount,
   };
-}
-
-function buildLatestBlockMap(blockItems = []) {
-  const next = new Map();
-  blockItems.forEach((item) => {
-    if (!item?.sourceRowKey || next.has(item.sourceRowKey)) return;
-    next.set(item.sourceRowKey, item);
-  });
-  return next;
-}
-
-function getBlockLifecycleState(item) {
-  if (!item) return 'unknown';
-  if (isAuditPaymentLog(item)) return 'payment';
-  if (item.resultList === 'aktif_alindi') return 'activated';
-  if (item.resultList === 'kapandi') return 'closed';
-  if (getCurrentBlockedAmount(item) > 0) return 'unresolved';
-  if (item.resultList === 'merkez' && item.resolution === 'cozuldu') return 'resolved';
-  return 'unknown';
 }
 
 /* legacy payment helpers moved to src/lib/payments.js
@@ -1155,8 +1132,35 @@ async function repairLegacyStatusRows(transactionRows = [], blockRows = []) {
     }
     return shouldRepairBlockStatus(row.type);
   });
+  const normalizedTransactions = transactionRows.map((row) => ({
+    ...row,
+    status: normalizeStatus(row.status, 'pasif'),
+  }));
+  const normalizedBlocks = blockRows.map((row) => ({
+    ...row,
+    type: (row.result_list || '') === SET_PAYMENT_RESULT
+      ? normalizeStatus(row.type, 'pasif')
+      : normalizeBlockedStatus(row.type),
+  }));
+  const blockRepairs = collectNegativeStatusBlockRepairs(normalizedTransactions, normalizedBlocks);
+  const duplicateBlockRepairs = collectDuplicateOpenBlockRepairs(normalizedBlocks);
 
-  if (!txFixes.length && !blockFixes.length) return;
+  if (
+    !txFixes.length &&
+    !blockFixes.length &&
+    !blockRepairs.inserts.length &&
+    !blockRepairs.updates.length &&
+    !duplicateBlockRepairs.length
+  ) {
+    return {
+      txFixedCount: 0,
+      blockFixedCount: 0,
+      insertedBlockCount: 0,
+      updatedBlockCount: 0,
+      duplicateBlockCount: 0,
+      didRepair: false,
+    };
+  }
 
   await Promise.all([
     ...txFixes.map((row) =>
@@ -1181,7 +1185,70 @@ async function repairLegacyStatusRows(transactionRows = [], blockRows = []) {
           if (error) throw error;
         })
     ),
+    ...blockRepairs.updates
+      .filter((row) => row.id)
+      .map((row) =>
+        supabase
+          .from('blocks')
+          .update({
+            type: row.type,
+            amount: Number(row.amount || 0),
+            note: row.note || '',
+            date: row.date || TODAY,
+            person_name: row.person_name || '',
+            account_name: row.account_name || '',
+            resolution: 'cozulmedi',
+            result_list: 'merkez',
+            resolved_amount: 0,
+          })
+          .eq('id', row.id)
+          .then(({ error }) => {
+            if (error) throw error;
+          })
+      ),
+    ...duplicateBlockRepairs.map((row) =>
+      supabase
+        .from('blocks')
+        .update({
+          resolution: row.resolution,
+          result_list: row.result_list,
+          resolved_amount: Number(row.resolved_amount || 0),
+          note: row.note || '',
+        })
+        .eq('id', row.id)
+        .then(({ error }) => {
+          if (error) throw error;
+        })
+    ),
   ]);
+
+  if (blockRepairs.inserts.length) {
+    const { error: insertRepairError } = await supabase.from('blocks').insert(
+      blockRepairs.inserts.map((item) => ({
+        source_row_key: item.source_row_key,
+        date: item.date || TODAY,
+        person_name: item.person_name || '',
+        account_name: item.account_name || '',
+        amount: Number(item.amount || 0),
+        type: item.type,
+        note: item.note || '',
+        resolution: 'cozulmedi',
+        result_list: 'merkez',
+        resolved_amount: 0,
+        created_by: item.created_by || '',
+      }))
+    );
+    if (insertRepairError) throw insertRepairError;
+  }
+
+  return {
+    txFixedCount: txFixes.length,
+    blockFixedCount: blockFixes.length,
+    insertedBlockCount: blockRepairs.inserts.length,
+    updatedBlockCount: blockRepairs.updates.length,
+    duplicateBlockCount: duplicateBlockRepairs.length,
+    didRepair: true,
+  };
 }
 
 async function loadBanksFromDb() {
@@ -1195,7 +1262,7 @@ async function loadBanksFromDb() {
 async function loadSupabaseAppData() {
   setAppLoading(true);
   try {
-    const [usersRes, banksRes, peopleRes, accountsRes, txRes, blocksRes] = await Promise.all([
+    let [usersRes, banksRes, peopleRes, accountsRes, txRes, blocksRes] = await Promise.all([
       supabase.from('users').select('*').eq('is_active', true).order('created_at', { ascending: true }),
       supabase.from('banks').select('*').order('name', { ascending: true }),
       supabase.from('people').select('*').order('created_at', { ascending: true }),
@@ -1211,7 +1278,15 @@ async function loadSupabaseAppData() {
     if (blocksRes.error) throw blocksRes.error;
 
     try {
-      await repairLegacyStatusRows(txRes.data || [], blocksRes.data || []);
+      const repairSummary = await repairLegacyStatusRows(txRes.data || [], blocksRes.data || []);
+      if (repairSummary?.didRepair) {
+        [txRes, blocksRes] = await Promise.all([
+          supabase.from('transactions').select('*').order('day', { ascending: true }),
+          supabase.from('blocks').select('*').order('created_at', { ascending: false }),
+        ]);
+        if (txRes.error) throw txRes.error;
+        if (blocksRes.error) throw blocksRes.error;
+      }
     } catch {}
 
     const nextUsers = (usersRes.data || [])
