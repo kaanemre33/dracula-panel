@@ -62,6 +62,8 @@ import {
   collectNegativeStatusBlockRepairs,
   getBlockLifecycleState,
   isOpenBlockLifecycle,
+  normalizeBlockResolution,
+  normalizeBlockResultList,
 } from './lib/blockSync';
 import { appendStructuredSheet, renderPdfHeader, renderPdfSection } from './lib/exportHelpers';
 import { BlockStatusModal } from './components/BlockStatusModal';
@@ -307,9 +309,11 @@ function isNegativeStatus(status) {
 function getResolvedReleaseAmount(item) {
   if (!item) return 0;
   const totalAmount = Number(item.amount || 0);
+  const resultList = normalizeBlockResultList(item.resultList);
+  const resolution = normalizeBlockResolution(item.resolution);
   if (isAuditPaymentLog(item)) return 0;
-  if (item.resultList === 'kapandi' || item.resultList === 'aktif_alindi') return 0;
-  if (item.resultList !== 'merkez' || item.resolution !== 'cozuldu') return 0;
+  if (resultList === 'kapandi' || resultList === 'aktif_alindi') return 0;
+  if (resultList !== 'merkez' || resolution !== 'cozuldu') return 0;
   return Math.max(0, Math.min(totalAmount, Number(item.resolvedAmount || 0)));
 }
 
@@ -317,9 +321,11 @@ function getCurrentBlockedAmount(item) {
   if (!item) return 0;
   if (isAuditPaymentLog(item)) return 0;
   const totalAmount = Number(item.amount || 0);
-  if (item.resultList === 'kapandi' || item.resultList === 'aktif_alindi') return 0;
-  if (item.resolution === 'cozulmedi') return totalAmount;
-  if (item.resultList === 'merkez' && item.resolution === 'cozuldu') {
+  const resultList = normalizeBlockResultList(item.resultList);
+  const resolution = normalizeBlockResolution(item.resolution);
+  if (resultList === 'kapandi' || resultList === 'aktif_alindi') return 0;
+  if (resolution === 'cozulmedi') return totalAmount;
+  if (resultList === 'merkez' && resolution === 'cozuldu') {
     return Math.max(0, totalAmount - getResolvedReleaseAmount(item));
   }
   return 0;
@@ -746,13 +752,21 @@ export default function App() {
   }
 
   function getBlockResultMeta(item) {
-    const blockedAmount = getCurrentBlockedAmount(item);
-    const totalAmount = Number(item?.amount || 0);
-    if (item?.resultList === 'aktif_alindi') return { label: 'AKTİFE ALINDI', className: 'text-teal-700' };
-    if (item?.resultList === 'kapandi') return { label: 'KAPANDI', className: 'text-slate-700' };
-    if (blockedAmount > 0 && blockedAmount < totalAmount) return { label: 'KISMİ BLOKE', className: 'text-amber-700' };
-    if (blockedAmount > 0) return { label: 'ÇÖZÜLMEDİ', className: 'text-rose-700' };
-    return { label: 'ÇÖZÜLDÜ', className: 'text-teal-700' };
+    const lifecycle = getBlockLifecycleState(item);
+    if (lifecycle === 'activated') return { label: 'AKTİFE ALINDI', className: 'text-teal-700' };
+    if (lifecycle === 'closed') return { label: 'KAPANDI', className: 'text-slate-700' };
+    if (lifecycle === 'resolved') return { label: 'ÇÖZÜLDÜ', className: 'text-teal-700' };
+    if (lifecycle === 'unresolved') return { label: 'ÇÖZÜLMEDİ', className: 'text-rose-700' };
+    return { label: 'MERKEZ', className: 'text-slate-500' };
+  }
+
+  function getBlockResolutionLabel(item) {
+    const resolution = normalizeBlockResolution(item?.resolution, 'cozulmedi');
+    if (resolution === 'cozuldu') return 'Çözüldü';
+    if (resolution === 'cozulmedi') return 'Çözülmedi';
+    if (resolution === 'odendi') return 'Ödendi';
+    if (resolution === 'odenmedi') return 'Ödenmedi';
+    return resolution;
   }
 
   const groupedTotals = useMemo(() => {
@@ -807,17 +821,17 @@ export default function App() {
   const filteredBlockCenter = useMemo(() => {
     if (!filter.trim()) return mergedBlockCenterItems;
     return mergedBlockCenterItems.filter((b) =>
-      `${b.personName} ${b.accountName} ${b.note} ${b.type} ${b.resultList} ${b.resolution}`.toLowerCase().includes(filter.toLowerCase())
+      `${b.personName} ${b.accountName} ${b.note} ${getStatusLabel(b.type)} ${getBlockResultMeta(b).label} ${getBlockResolutionLabel(b)}`.toLowerCase().includes(filter.toLowerCase())
     );
   }, [mergedBlockCenterItems, filter]);
 
   const blockTableRows = useMemo(
-    () => filteredBlockCenter.filter((item) => getBlockLifecycleState(item) === 'unresolved'),
+    () => filteredBlockCenter.filter((item) => isOpenBlockLifecycle(item)),
     [filteredBlockCenter]
   );
 
   const blockSummary = useMemo(() => {
-    const unresolvedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'unresolved');
+    const unresolvedItems = mergedBlockCenterItems.filter((item) => isOpenBlockLifecycle(item));
     const resolvedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'resolved');
     const closedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'closed');
     const activatedItems = mergedBlockCenterItems.filter((item) => getBlockLifecycleState(item) === 'activated');
@@ -922,8 +936,8 @@ export default function App() {
               negativeAmount: breakdown.negativeAmount,
               statusLabel: getStatusLabel(normalizedStatus),
               blockResultLabel: blockItem ? getBlockResultMeta(blockItem).label : '-',
-              blockResultList: blockItem?.resultList || '-',
-              blockResolution: blockItem?.resolution || '-',
+              blockResultList: blockItem ? getBlockResultMeta(blockItem).label : '-',
+              blockResolution: blockItem ? getBlockResolutionLabel(blockItem) : '-',
               blockNote: blockItem?.note || '',
               blockCreatedAt: blockItem?.createdAt || '',
               blockChangedAt: getBlockChangedAt(blockItem, historyRowByKey),
@@ -1102,8 +1116,9 @@ function buildHistoryFromDb(transactionRows = [], peopleList = []) {
   return next;
 }
 
-function normalizeBlockRecord(row) {
-  const resultList = row.result_list || 'merkez';
+  function normalizeBlockRecord(row) {
+  const resultList = normalizeBlockResultList(row.result_list || 'merkez');
+  const resolution = normalizeBlockResolution(row.resolution || 'cozulmedi');
   const normalizedType = resultList === SET_PAYMENT_RESULT ? normalizeStatus(row.type, 'pasif') : normalizeBlockedStatus(row.type);
   return {
     id: row.id,
@@ -1114,7 +1129,7 @@ function normalizeBlockRecord(row) {
     amount: Number(row.amount || 0),
     type: normalizedType,
     note: row.note || '',
-    resolution: row.resolution || 'cozulmedi',
+    resolution,
     resultList,
     resolvedAmount: Number(row.resolved_amount || 0),
     createdBy: row.created_by || '',
@@ -1171,10 +1186,10 @@ async function repairLegacyStatusRows(transactionRows = [], blockRows = []) {
         })
     ),
     ...blockFixes.map((row) =>
-      supabase
-        .from('blocks')
-        .update({
-          type: (row.result_list || '') === SET_PAYMENT_RESULT
+        supabase
+          .from('blocks')
+          .update({
+          type: normalizeBlockResultList(row.result_list || 'merkez') === SET_PAYMENT_RESULT
             ? normalizeStatus(row.type, 'pasif')
             : normalizeBlockedStatus(row.type),
         })
@@ -1592,7 +1607,7 @@ async function loadSupabaseAppData() {
     renderPdfSection(
       doc,
       'ACIK BLOKE KAYITLARI',
-      blockTableRows.map((item, index) => `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(getCurrentBlockedAmount(item))} | ${STATUS_META[item.type]?.label || item.type} | Bloke Olma: ${getBlockCreatedDisplayValue(item)} | Not: ${item.note || 'Not yok'} | Cozum: ${item.resolution} | Sonuc: ${item.resultList} | Olusturan: ${item.createdBy || '-'} | Son Degisiklik: ${formatDisplayDateTime(getBlockChangedAt(item, historyRowByKey))} | Son Islem: ${getBlockChangedBy(item, historyRowByKey) || '-'}`),
+      blockTableRows.map((item, index) => `${index + 1}. ${item.personName} | ${item.accountName} | ${formatMoney(getCurrentBlockedAmount(item))} | ${getStatusLabel(item.type)} | Bloke Olma: ${getBlockCreatedDisplayValue(item)} | Not: ${item.note || 'Not yok'} | Cozum: ${getBlockResolutionLabel(item)} | Sonuc: ${getBlockResultMeta(item).label} | Olusturan: ${item.createdBy || '-'} | Son Degisiklik: ${formatDisplayDateTime(getBlockChangedAt(item, historyRowByKey))} | Son Islem: ${getBlockChangedBy(item, historyRowByKey) || '-'}`),
       y
     );
     doc.save(`bloke-merkezi-${selectedDay}.pdf`);
@@ -1625,7 +1640,9 @@ async function loadSupabaseAppData() {
         ...item,
         blockCreatedAt: getBlockCreatedDisplayValue(item),
         amount: Number(getCurrentBlockedAmount(item) || 0),
-        typeLabel: STATUS_META[item.type]?.label || item.type,
+        typeLabel: getStatusLabel(item.type),
+        resolution: getBlockResolutionLabel(item),
+        resultList: getBlockResultMeta(item).label,
         changedAt: formatDisplayDateTime(getBlockChangedAt(item, historyRowByKey)),
         changedBy: getBlockChangedBy(item, historyRowByKey),
       })),
@@ -1902,8 +1919,8 @@ async function saveSetDurumu() {
               amount: Number(item.amount || 0),
               type: normalizeBlockedStatus(item.type),
               note: item.note || '',
-              resolution: item.resolution,
-              result_list: item.resultList,
+              resolution: normalizeBlockResolution(item.resolution),
+              result_list: normalizeBlockResultList(item.resultList),
               resolved_amount: Number(item.resolvedAmount || 0),
             })
             .eq('id', item.id);
@@ -1921,8 +1938,8 @@ async function saveSetDurumu() {
         amount: Number(item.amount || 0),
         type: normalizeBlockedStatus(item.type),
         note: item.note || '',
-        resolution: item.resolution,
-        result_list: item.resultList,
+        resolution: normalizeBlockResolution(item.resolution),
+        result_list: normalizeBlockResultList(item.resultList),
         resolved_amount: Number(item.resolvedAmount || 0),
         created_by: item.createdBy,
       }));
@@ -3837,7 +3854,7 @@ useEffect(() => {
                     </div>
                     <div className="text-right">
                       <div className="font-black text-slate-950">{formatMoney(item.amount)}</div>
-                      <div className="mt-1 text-sm font-bold text-slate-500">{item.resultList || item.resolution}</div>
+                      <div className="mt-1 text-sm font-bold text-slate-500">{getBlockResultMeta(item).label}</div>
                     </div>
                   </div>
                 )}

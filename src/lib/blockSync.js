@@ -1,21 +1,36 @@
-import { isNegativeStatus, normalizeBlockedStatus } from './status.js';
+import { isNegativeStatus, normalizeBlockedStatus, toStatusKey } from './status.js';
 
 const PAYMENT_RESULT_LISTS = new Set(['setci_odemesi', 'set_odemesi']);
+const BLOCK_RESOLUTION_VALUES = new Set(['cozulmedi', 'cozuldu', 'odendi', 'odenmedi']);
+const BLOCK_RESULT_LIST_ALIASES = {
+  merkez: 'merkez',
+  aktif_alindi: 'aktif_alindi',
+  aktife_alindi: 'aktif_alindi',
+  kapandi: 'kapandi',
+};
+const BLOCK_RESOLUTION_ALIASES = {
+  unresolved: 'cozulmedi',
+  resolved: 'cozuldu',
+  cozulmedi: 'cozulmedi',
+  cozuldu: 'cozuldu',
+  odendi: 'odendi',
+  odenmedi: 'odenmedi',
+};
 
 function getSourceRowKey(item) {
   return String(item?.source_row_key || item?.sourceRowKey || item?.row_key || item?.rowKey || '');
 }
 
 function getResultList(item) {
-  return String(item?.result_list || item?.resultList || 'merkez');
+  return normalizeBlockResultList(item?.result_list || item?.resultList || 'merkez');
 }
 
 function getResolution(item) {
-  return String(item?.resolution || 'cozulmedi');
+  return normalizeBlockResolution(item?.resolution || 'cozulmedi');
 }
 
 function getLifecycleResultList(item) {
-  return String(item?.result_list || item?.resultList || 'merkez');
+  return normalizeBlockResultList(item?.result_list || item?.resultList || 'merkez');
 }
 
 function getAmount(item) {
@@ -34,6 +49,20 @@ function getMergedDuplicateNote(item) {
   const note = String(item?.note || '').trim();
   const suffix = 'Legacy duplicate acik blok kaydi otomatik kapatildi';
   return note ? `${note} | ${suffix}` : suffix;
+}
+
+export function normalizeBlockResultList(value, fallback = 'merkez') {
+  const normalized = toStatusKey(value);
+  if (!normalized) return fallback;
+  if (PAYMENT_RESULT_LISTS.has(normalized)) return normalized;
+  return BLOCK_RESULT_LIST_ALIASES[normalized] || fallback;
+}
+
+export function normalizeBlockResolution(value, fallback = 'cozulmedi') {
+  const normalized = toStatusKey(value);
+  if (!normalized) return fallback;
+  if (BLOCK_RESOLUTION_VALUES.has(normalized)) return normalized;
+  return BLOCK_RESOLUTION_ALIASES[normalized] || fallback;
 }
 
 export function getBlockLifecycleState(item) {
