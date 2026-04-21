@@ -57,6 +57,10 @@ export function getBlockLifecycleState(item) {
   return 'unknown';
 }
 
+export function isOpenBlockLifecycle(item) {
+  return getBlockLifecycleState(item) === 'unresolved';
+}
+
 export function buildLatestBlockMap(blockItems = []) {
   const sortedItems = [...blockItems].sort((left, right) => getSortValue(right).localeCompare(getSortValue(left)));
   const latestByRowKey = new Map();

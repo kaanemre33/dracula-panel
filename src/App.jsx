@@ -61,6 +61,7 @@ import {
   collectDuplicateOpenBlockRepairs,
   collectNegativeStatusBlockRepairs,
   getBlockLifecycleState,
+  isOpenBlockLifecycle,
 } from './lib/blockSync';
 import { appendStructuredSheet, renderPdfHeader, renderPdfSection } from './lib/exportHelpers';
 import { BlockStatusModal } from './components/BlockStatusModal';
@@ -429,10 +430,7 @@ function getBlockChangedBy(item, historyRowByKey) {
 }
 
 function getEffectiveStatusFromBlockItem(item) {
-  const lifecycle = getBlockLifecycleState(item);
-  if (lifecycle === 'activated' || lifecycle === 'resolved') return 'aktif';
-  if (lifecycle === 'closed') return 'pasif';
-  if (lifecycle === 'unresolved') return normalizeBlockedStatus(item.type);
+  if (isOpenBlockLifecycle(item)) return normalizeBlockedStatus(item.type);
   return null;
 }
 
@@ -450,7 +448,7 @@ function applyLatestBlockStateToHistory(historyByDay = {}, blockItems = []) {
 
       return {
         ...row,
-        amount: getBlockLifecycleState(blockItem) === 'closed' ? 0 : Number(row.amount || 0),
+        amount: Number(row.amount || 0),
         status: nextStatus,
       };
     });
@@ -680,7 +678,7 @@ export default function App() {
         if (!isNegativeStatus(normalizedStatus)) return items;
 
         const latestBlockItem = currentDayBlockByRowKey.get(row.id);
-        if (latestBlockItem && getBlockLifecycleState(latestBlockItem) === 'unresolved') return items;
+        if (isOpenBlockLifecycle(latestBlockItem)) return items;
 
         items.push({
           id: `derived-${row.id}`,
@@ -1814,8 +1812,7 @@ async function saveSetDurumu() {
     const isBlockedNow = nextStatus === 'bloke' || nextStatus === 'sifre_kilit';
     const sourceRowKey = makeRowKey(selectedDay, nextRow.personId, nextRow.accountName);
     const latestBlockItem = latestBlockByRowKey.get(sourceRowKey) || null;
-    const latestBlockLifecycle = getBlockLifecycleState(latestBlockItem);
-    const hasOpenBlock = latestBlockLifecycle === 'unresolved';
+    const hasOpenBlock = isOpenBlockLifecycle(latestBlockItem);
 
     if (isBlockedNow) {
       const carriedResolvedAmount = Math.max(
@@ -2885,7 +2882,7 @@ async function setBlockAsResolved(mode = 'cozuldu') {
       if (existingRowsError) throw existingRowsError;
 
       const latestExistingBlock = existingRows?.[0] ? normalizeBlockRecord(existingRows[0]) : null;
-      if (latestExistingBlock && getBlockLifecycleState(latestExistingBlock) === 'unresolved') {
+      if (isOpenBlockLifecycle(latestExistingBlock)) {
         targetBlockId = latestExistingBlock.id;
       } else {
         const { data: insertedBlock, error: insertError } = await supabase
@@ -3341,8 +3338,7 @@ useEffect(() => {
                         const liveStatus = normalizeStatus(liveRow.status, 'pasif');
                         const persistedRow = (historyByDay[selectedDay] || []).find((item) => item.id === row.id);
                         const activeBlockItem = currentDayBlockByRowKey.get(row.id) || null;
-                        const blockManagedLifecycle = getBlockLifecycleState(activeBlockItem);
-                        const isBlockManagedRow = blockManagedLifecycle === 'unresolved';
+                        const isBlockManagedRow = isOpenBlockLifecycle(activeBlockItem);
                         const statusLockedForUser = !canManage && isManagerLockedStatus(persistedRow?.status);
                         const rowTone = isBlockManagedRow
                           ? liveStatus === 'sifre_kilit'
